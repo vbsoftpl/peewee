@@ -92,7 +92,7 @@ def print_models(introspector, tables=None, preserve_order=False):
 
         print_('')
         print_('    class Meta:')
-        print_('        db_table = \'%s\'' % table)
+        print_('        table_name = \'%s\'' % table)
         multi_column_indexes = database.multi_column_indexes(table)
         if multi_column_indexes:
             print_('        indexes = (')
@@ -111,6 +111,8 @@ def print_models(introspector, tables=None, preserve_order=False):
                 if col in primary_keys])
             pk_list = ', '.join("'%s'" % pk for pk in pk_field_names)
             print_('        primary_key = CompositeKey(%s)' % pk_list)
+        elif not primary_keys:
+            print_('        primary_key = False')
         print_('')
 
         seen.add(table)

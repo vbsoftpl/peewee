@@ -4,7 +4,7 @@ import sys
 import warnings
 from distutils.core import setup
 from distutils.extension import Extension
-from distutils.version import StrictVersion
+from distutils.version import LooseVersion
 
 f = open(os.path.join(os.path.dirname(__file__), 'README.rst'))
 readme = f.read()
@@ -12,6 +12,7 @@ f.close()
 
 setup_kwargs = {}
 cython_min_version = '0.22.1'
+ext_modules = []
 
 try:
     from Cython.Distutils import build_ext
@@ -26,7 +27,7 @@ else:
         cython_installed = False
         warnings.warn('Cython C extensions disabled as you are not using '
                       'CPython.')
-    elif StrictVersion(cython_version) < StrictVersion(cython_min_version):
+    elif LooseVersion(cython_version) < LooseVersion(cython_min_version):
         cython_installed = False
         warnings.warn('Cython C extensions for peewee will NOT be built, '
                       'because the installed Cython version '
@@ -36,6 +37,9 @@ else:
     else:
         cython_installed = True
 
+NO_SQLITE = os.environ.get('NO_SQLITE') or False
+
+
 speedups_ext_module = Extension(
     'playhouse._speedups',
     ['playhouse/_speedups.pyx'])
@@ -44,15 +48,19 @@ sqlite_udf_module = Extension(
     ['playhouse/_sqlite_udf.pyx'])
 sqlite_ext_module = Extension(
     'playhouse._sqlite_ext',
-    ['playhouse/_sqlite_ext.pyx'])
+    ['playhouse/_sqlite_ext.pyx'],
+    libraries=['sqlite3'])
 
 
-ext_modules = []
 if cython_installed:
-    ext_modules.extend([
-        speedups_ext_module,
-        sqlite_udf_module,
-        sqlite_ext_module])
+    ext_modules = [speedups_ext_module]
+    if not NO_SQLITE:
+        ext_modules.extend([
+            sqlite_udf_module,
+            sqlite_ext_module,
+        ])
+    else:
+        warnings.warn('SQLite extensions will not be built at users request.')
 
 if ext_modules:
     setup_kwargs.update(
@@ -77,6 +85,5 @@ setup(
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
     ],
-    scripts = ['pwiz.py', 'playhouse/pskel'],
-    **setup_kwargs
-)
+    scripts = ['pwiz.py'],
+    **setup_kwargs)

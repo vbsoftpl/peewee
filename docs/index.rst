@@ -6,13 +6,18 @@
 peewee
 ======
 
-.. image:: peewee-logo.png
+.. image:: peewee3-logo.png
 
-Peewee is a simple and small ORM. It has few (but expressive) concepts, making it easy to learn and intuitive to use.
+.. attention::
+    Peewee 3.0 has been released (you are looking at the 3.0 documentation). To
+    see a list of backwards-incompatible changes, see :ref:`the list of changes <changes>`.
+
+Peewee is a simple and small ORM. It has few (but expressive) concepts, making
+it easy to learn and intuitive to use.
 
 * A small, expressive ORM
-* Written in python with support for versions 2.6+ and 3.2+.
-* built-in support for sqlite, mysql and postgresql
+* Written in python with support for versions 2.7+ and 3.4+ (developed with 3.6)
+* Built-in support for SQLite, MySQL and Postgresql.
 * :ref:`numerous extensions available <playhouse>` (:ref:`postgres hstore/json/arrays <postgres_ext>`, :ref:`sqlite full-text-search <sqlite_ext>`, :ref:`schema migrations <migrate>`, and much more).
 
 .. image:: postgresql.png
@@ -33,6 +38,7 @@ New to peewee? Here is a list of documents you might find most helpful when gett
 started:
 
 * :ref:`Quickstart guide <quickstart>` -- this guide covers all the bare essentials. It will take you between 5 and 10 minutes to go through it.
+* :ref:`Example queries <query-examples>` taken from the `PostgreSQL exercises website <https://pgexercises.com>`_.
 * :ref:`Guide to the various query operators <query-operators>` describes how to construct queries and combine expressions.
 * :ref:`Field types table <field_types_table>` lists the various field types peewee supports and the parameters they accept. There is also an :ref:`extension module <playhouse>` that contains :ref:`special/custom field types <extra-fields>`.
 
@@ -46,14 +52,17 @@ Contents:
    peewee/installation
    peewee/quickstart
    peewee/example
-   peewee/more-resources
    peewee/contributing
+   peewee/query_examples
    peewee/database
    peewee/models
    peewee/querying
    peewee/transactions
-   peewee/playhouse
+   peewee/changes
    peewee/api
+   peewee/sqlite_ext
+   peewee/playhouse
+   peewee/query_builder
    peewee/hacks
 
 Note
