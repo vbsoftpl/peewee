@@ -9,7 +9,7 @@ from .base import BaseTestCase
 from .base import DatabaseTestCase
 
 
-database = CSqliteExtDatabase('peewee_test.db', timeout=0.1,
+database = CSqliteExtDatabase('peewee_test.db', timeout=100,
                               hash_functions=1)
 
 
@@ -147,27 +147,85 @@ class TestHashFunctions(CyDatabaseTestCase):
 
 
 class TestBackup(CyDatabaseTestCase):
-    backup_filename = 'test_backup.db'
+    backup_filenames = set(('test_backup.db', 'test_backup1.db',
+                            'test_backup2.db'))
 
     def tearDown(self):
         super(TestBackup, self).tearDown()
-        if os.path.exists(self.backup_filename):
-            os.unlink(self.backup_filename)
+        for backup_filename in self.backup_filenames:
+            if os.path.exists(backup_filename):
+                os.unlink(backup_filename)
+
+    def _populate_test_data(self, nrows=100, db=None):
+        db = self.database if db is None else db
+        db.execute_sql('CREATE TABLE register (id INTEGER NOT NULL PRIMARY KEY'
+                       ', value INTEGER NOT NULL)')
+        with db.atomic():
+            for i in range(nrows):
+                db.execute_sql('INSERT INTO register (value) VALUES (?)', (i,))
+
+    def test_backup(self):
+        self._populate_test_data()
+
+        # Back-up to an in-memory database and verify contents.
+        other_db = CSqliteExtDatabase(':memory:')
+        self.database.backup(other_db)
+        cursor = other_db.execute_sql('SELECT value FROM register ORDER BY '
+                                      'value;')
+        self.assertEqual([val for val, in cursor.fetchall()], list(range(100)))
+        other_db.close()
+
+    def test_backup_preserve_pagesize(self):
+        db1 = CSqliteExtDatabase('test_backup1.db')
+        with db1.connection_context():
+            db1.page_size = 8192
+            self._populate_test_data(db=db1)
+
+        db1.connect()
+        self.assertEqual(db1.page_size, 8192)
+
+        db2 = CSqliteExtDatabase('test_backup2.db')
+        db1.backup(db2)
+        self.assertEqual(db2.page_size, 8192)
+        nrows, = db2.execute_sql('select count(*) from register;').fetchone()
+        self.assertEqual(nrows, 100)
 
     def test_backup_to_file(self):
-        # Populate the database with some test data.
-        self.execute('CREATE TABLE register (id INTEGER NOT NULL PRIMARY KEY, '
-                     'value INTEGER NOT NULL)')
-        with self.database.atomic():
-            for i in range(100):
-                self.execute('INSERT INTO register (value) VALUES (?)', i)
+        self._populate_test_data()
 
-        self.database.backup_to_file(self.backup_filename)
-        backup_db = CSqliteExtDatabase(self.backup_filename)
+        self.database.backup_to_file('test_backup.db')
+        backup_db = CSqliteExtDatabase('test_backup.db')
         cursor = backup_db.execute_sql('SELECT value FROM register ORDER BY '
                                        'value;')
         self.assertEqual([val for val, in cursor.fetchall()], list(range(100)))
         backup_db.close()
+
+    def test_backup_progress(self):
+        self._populate_test_data()
+
+        accum = []
+        def progress(remaining, total, is_done):
+            accum.append((remaining, total, is_done))
+
+        other_db = CSqliteExtDatabase(':memory:')
+        self.database.backup(other_db, pages=1, progress=progress)
+        self.assertTrue(len(accum) > 0)
+
+        sql = 'select value from register order by value;'
+        self.assertEqual([r for r, in other_db.execute_sql(sql)],
+                         list(range(100)))
+        other_db.close()
+
+    def test_backup_progress_error(self):
+        self._populate_test_data()
+
+        def broken_progress(remaining, total, is_done):
+            raise ValueError('broken')
+
+        other_db = CSqliteExtDatabase(':memory:')
+        self.assertRaises(ValueError, self.database.backup, other_db,
+                          progress=broken_progress)
+        other_db.close()
 
 
 class TestBlob(CyDatabaseTestCase):

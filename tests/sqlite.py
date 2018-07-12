@@ -7,15 +7,19 @@ from playhouse.sqlite_ext import *
 from playhouse._sqlite_ext import TableFunction
 
 from .base import BaseTestCase
+from .base import IS_SQLITE_9
 from .base import ModelTestCase
 from .base import TestModel
+from .base import db_loader
+from .base import get_in_memory_db
 from .base import requires_models
-from .base import skip_case_unless
 from .base import skip_if
+from .base import skip_unless
+from .base_models import User
 from .sqlite_helpers import json_installed
 
 
-database = SqliteExtDatabase(':memory:', c_extensions=False, timeout=0.1)
+database = SqliteExtDatabase(':memory:', c_extensions=False, timeout=100)
 
 
 CLOSURE_EXTENSION = os.environ.get('PEEWEE_CLOSURE_EXTENSION')
@@ -109,15 +113,6 @@ class RowIDModel(TestModel):
     data = IntegerField()
 
 
-class APIData(TestModel):
-    data = JSONField()
-    value = TextField()
-
-
-class Metadata(TestModel):
-    data = JSONField()
-
-
 class KeyData(TestModel):
     key = TextField()
     data = JSONField()
@@ -133,6 +128,9 @@ class FTS5Test(FTS5Model):
     title = SearchField()
     data = SearchField()
     misc = SearchField(unindexed=True)
+
+    class Meta:
+        legacy_table_names = False
 
 
 class Series(TableFunction):
@@ -191,7 +189,7 @@ class Split(TableFunction):
         raise StopIteration
 
 
-@skip_case_unless(sqlite3.sqlite_version_info[:2] >= (3, 9))
+@skip_unless(IS_SQLITE_9, 'requires sqlite >= 3.9')
 class TestTableFunction(BaseTestCase):
     def setUp(self):
         super(TestTableFunction, self).setUp()
@@ -201,21 +199,24 @@ class TestTableFunction(BaseTestCase):
         super(TestTableFunction, self).tearDown()
         self.conn.close()
 
+    def execute(self, sql, params=None):
+        return self.conn.execute(sql, params or ())
+
     def test_split(self):
         Split.register(self.conn)
-        curs = self.conn.execute('select part from str_split(?) order by part '
-                                 'limit 3', ('well hello huey and zaizee',))
+        curs = self.execute('select part from str_split(?) order by part '
+                            'limit 3', ('well hello huey and zaizee',))
         self.assertEqual([row for row, in curs.fetchall()],
                          ['and', 'hello', 'huey'])
 
     def test_split_tbl(self):
         Split.register(self.conn)
-        self.conn.execute('create table post (content TEXT);')
-        self.conn.execute('insert into post (content) values (?), (?), (?)',
-                          ('huey secret post',
-                           'mickey message',
-                           'zaizee diary'))
-        curs = self.conn.execute('SELECT * FROM post, str_split(post.content)')
+        self.execute('create table post (content TEXT);')
+        self.execute('insert into post (content) values (?), (?), (?)',
+                     ('huey secret post',
+                      'mickey message',
+                      'zaizee diary'))
+        curs = self.execute('SELECT * FROM post, str_split(post.content)')
         results = curs.fetchall()
         self.assertEqual(results, [
             ('huey secret post', 'huey'),
@@ -235,7 +236,7 @@ class TestTableFunction(BaseTestCase):
             sql = 'SELECT * FROM series(%s)' % param_sql
             if extra_sql:
                 sql = ' '.join((sql, extra_sql))
-            curs = self.conn.execute(sql, params)
+            curs = self.execute(sql, params)
             self.assertEqual([row for row, in curs.fetchall()], values)
 
         assertSeries((0, 10, 2), [0, 2, 4, 6, 8, 10])
@@ -246,18 +247,16 @@ class TestTableFunction(BaseTestCase):
 
     def test_series_tbl(self):
         Series.register(self.conn)
-        self.conn.execute('CREATE TABLE nums (id INTEGER PRIMARY KEY)')
-        self.conn.execute('INSERT INTO nums DEFAULT VALUES;')
-        self.conn.execute('INSERT INTO nums DEFAULT VALUES;')
-        curs = self.conn.execute(
-            'SELECT * FROM nums, series(nums.id, nums.id + 2)')
+        self.execute('CREATE TABLE nums (id INTEGER PRIMARY KEY)')
+        self.execute('INSERT INTO nums DEFAULT VALUES;')
+        self.execute('INSERT INTO nums DEFAULT VALUES;')
+        curs = self.execute('SELECT * FROM nums, series(nums.id, nums.id + 2)')
         results = curs.fetchall()
         self.assertEqual(results, [
             (1, 1), (1, 2), (1, 3),
             (2, 2), (2, 3), (2, 4)])
 
-        curs = self.conn.execute(
-            'SELECT * FROM nums, series(nums.id) LIMIT 3')
+        curs = self.execute('SELECT * FROM nums, series(nums.id) LIMIT 3')
         results = curs.fetchall()
         self.assertEqual(results, [(1, 1), (1, 2), (1, 3)])
 
@@ -266,7 +265,7 @@ class TestTableFunction(BaseTestCase):
 
         def assertResults(regex, search_string, values):
             sql = 'SELECT * FROM regex_search(?, ?)'
-            curs = self.conn.execute(sql, (regex, search_string))
+            curs = self.execute(sql, (regex, search_string))
             self.assertEqual([row for row, in curs.fetchall()], values)
 
         assertResults(
@@ -296,12 +295,12 @@ class TestTableFunction(BaseTestCase):
             '')
         RegexSearch.register(self.conn)
 
-        self.conn.execute('create table posts (id integer primary key, msg)')
-        self.conn.execute('insert into posts (msg) values (?), (?), (?), (?)',
-                          messages)
-        cur = self.conn.execute('select posts.id, regex_search.rowid, regex_search.match '
-                                'FROM posts, regex_search(?, posts.msg)',
-                                ('[\w]+@[\w]+\.\w{2,3}',))
+        self.execute('create table posts (id integer primary key, msg)')
+        self.execute('insert into posts (msg) values (?), (?), (?), (?)',
+                     messages)
+        cur = self.execute('select posts.id, regex_search.rowid, regex_search.match '
+                           'FROM posts, regex_search(?, posts.msg)',
+                           ('[\w]+@[\w]+\.\w{2,3}',))
         results = cur.fetchall()
         self.assertEqual(results, [
             (1, 1, 'foo@example.fap'),
@@ -311,252 +310,209 @@ class TestTableFunction(BaseTestCase):
             (2, 5, 'huey@example.com'),
         ])
 
+    def test_error_instantiate(self):
+        class BrokenInstantiate(Series):
+            name = 'broken_instantiate'
+            print_tracebacks = False
 
-@skip_case_unless(json_installed)
+            def __init__(self, *args, **kwargs):
+                super(BrokenInstantiate, self).__init__(*args, **kwargs)
+                raise ValueError('broken instantiate')
+
+        BrokenInstantiate.register(self.conn)
+        self.assertRaises(sqlite3.OperationalError, self.execute,
+                          'SELECT * FROM broken_instantiate(1, 10)')
+
+    def test_error_init(self):
+        class BrokenInit(Series):
+            name = 'broken_init'
+            print_tracebacks = False
+
+            def initialize(self, start=0, stop=None, step=1):
+                raise ValueError('broken init')
+
+        BrokenInit.register(self.conn)
+        self.assertRaises(sqlite3.OperationalError, self.execute,
+                          'SELECT * FROM broken_init(1, 10)')
+        self.assertRaises(sqlite3.OperationalError, self.execute,
+                          'SELECT * FROM broken_init(0, 1)')
+
+    def test_error_iterate(self):
+        class BrokenIterate(Series):
+            name = 'broken_iterate'
+            print_tracebacks = False
+
+            def iterate(self, idx):
+                raise ValueError('broken iterate')
+
+        BrokenIterate.register(self.conn)
+        self.assertRaises(sqlite3.OperationalError, self.execute,
+                          'SELECT * FROM broken_iterate(1, 10)')
+        self.assertRaises(sqlite3.OperationalError, self.execute,
+                          'SELECT * FROM broken_iterate(0, 1)')
+
+    def test_error_iterate_delayed(self):
+        # Only raises an exception if the value 7 comes up.
+        class SomewhatBroken(Series):
+            name = 'somewhat_broken'
+            print_tracebacks = False
+
+            def iterate(self, idx):
+                ret = super(SomewhatBroken, self).iterate(idx)
+                if ret == (7,):
+                    raise ValueError('somewhat broken')
+                else:
+                    return ret
+
+        SomewhatBroken.register(self.conn)
+        curs = self.execute('SELECT * FROM somewhat_broken(0, 3)')
+        self.assertEqual(curs.fetchall(), [(0,), (1,), (2,), (3,)])
+
+        curs = self.execute('SELECT * FROM somewhat_broken(5, 8)')
+        self.assertEqual(curs.fetchone(), (5,))
+        self.assertRaises(sqlite3.OperationalError, curs.fetchall)
+
+        curs = self.execute('SELECT * FROM somewhat_broken(0, 2)')
+        self.assertEqual(curs.fetchall(), [(0,), (1,), (2,)])
+
+
+@skip_unless(json_installed(), 'requires sqlite json1')
 class TestJSONField(ModelTestCase):
     database = database
-    requires = [APIData, Metadata]
+    requires = [KeyData]
     test_data = [
-        {'metadata': {'tags': ['python', 'sqlite']},
-         'title': 'My List of Python and SQLite Resources',
-         'url': 'http://charlesleifer.com/blog/my-list-of-python-and-sqlite-resources/'},
-        {'metadata': {'tags': ['nosql', 'python', 'sqlite', 'cython']},
-         'title': "Using SQLite4's LSM Storage Engine as a Stand-alone NoSQL Database with Python",
-         'url': 'http://charlesleifer.com/blog/using-sqlite4-s-lsm-storage-engine-as-a-stand-alone-nosql-database-with-python/'},
-        {'metadata': {'tags': ['sqlite', 'search', 'python', 'peewee']},
-         'title': 'Building the SQLite FTS5 Search Extension',
-         'url': 'http://charlesleifer.com/blog/building-the-sqlite-fts5-search-extension/'},
-        {'metadata': {'tags': ['nosql', 'python', 'unqlite', 'cython']},
-         'title': 'Introduction to the fast new UnQLite Python Bindings',
-         'url': 'http://charlesleifer.com/blog/introduction-to-the-fast-new-unqlite-python-bindings/'},
-        {'metadata': {'tags': ['python', 'walrus', 'redis', 'nosql']},
-         'title': 'Alternative Redis-Like Databases with Python',
-         'url': 'http://charlesleifer.com/blog/alternative-redis-like-databases-with-python/'},
+        ('a', {'k1': 'v1', 'x1': {'y1': 'z1'}}),
+        ('b', {'k2': 'v2', 'x2': {'y2': 'z2'}}),
+        ('c', {'k1': 'v1', 'k2': 'v2'}),
+        ('d', {'x1': {'y1': 'z1', 'y2': 'z2'}}),
+        ('e', {'l1': [0, 1, 2], 'l2': [1, [3, 3], 7]}),
     ]
 
     def setUp(self):
         super(TestJSONField, self).setUp()
-        for entry in self.test_data:
-            APIData.create(data=entry, value=entry['title'])
-        self.Q = APIData.select().order_by(APIData.id)
+        with self.database.atomic():
+            for key, data in self.test_data:
+                KeyData.create(key=key, data=data)
+
+        self.Q = KeyData.select().order_by(KeyData.key)
+
+    def assertRows(self, where, expected):
+        self.assertEqual([kd.key for kd in self.Q.where(where)], expected)
+
+    def assertData(self, key, expected):
+        self.assertEqual(KeyData.get(KeyData.key == key).data, expected)
 
     def test_schema(self):
-        self.assertSQL(APIData._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "apidata" ('
+        self.assertSQL(KeyData._schema._create_table(), (
+            'CREATE TABLE IF NOT EXISTS "key_data" ('
             '"id" INTEGER NOT NULL PRIMARY KEY, '
-            '"data" JSON NOT NULL, '
-            '"value" TEXT NOT NULL)'), [])
-
-        self.assertSQL(Metadata._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "metadata" ('
-            '"id" INTEGER NOT NULL PRIMARY KEY, '
+            '"key" TEXT NOT NULL, '
             '"data" JSON NOT NULL)'), [])
 
-    def test_extract_array_agg(self):
-        value = (APIData
-                 .select(fn.json_group_array(
-                     APIData.data.extract('metadata.tags[0]')))
-                 .order_by(APIData.id)
-                 .scalar())
-        data = json.loads(value)
-        self.assertEqual(data, ['python', 'nosql', 'sqlite', 'nosql',
-                                'python'])
-
     def test_extract(self):
-        titles = self.Q.columns(APIData.data.extract('title')).tuples()
-        self.assertEqual([row for row, in titles], [
-            'My List of Python and SQLite Resources',
-            'Using SQLite4\'s LSM Storage Engine as a Stand-alone NoSQL Database with Python',
-            'Building the SQLite FTS5 Search Extension',
-            'Introduction to the fast new UnQLite Python Bindings',
-            'Alternative Redis-Like Databases with Python',
-        ])
-
-        tags = (self.Q
-                .columns(APIData.data.extract('metadata.tags').alias('tags'))
-                .dicts())
-        self.assertEqual(list(tags), [
-            {'tags': ['python', 'sqlite']},
-            {'tags': ['nosql', 'python', 'sqlite', 'cython']},
-            {'tags': ['sqlite', 'search', 'python', 'peewee']},
-            {'tags': ['nosql', 'python', 'unqlite', 'cython']},
-            {'tags': ['python', 'walrus', 'redis', 'nosql']},
-        ])
-
-        missing = self.Q.columns(APIData.data.extract('foo.bar')).tuples()
-        self.assertEqual([row for row, in missing], [None] * 5)
-
-    def test_length(self):
-        tag_len = (self.Q
-                   .columns(APIData.data.length('metadata.tags').alias('len'))
-                   .dicts())
-        self.assertEqual(list(tag_len), [
-            {'len': 2},
-            {'len': 4},
-            {'len': 4},
-            {'len': 4},
-            {'len': 4},
-        ])
-
-    def test_remove(self):
-        query = (self.Q
-                 .columns(
-                     fn.json_extract(
-                         APIData.data.remove('metadata.tags'),
-                         '$.metadata'))
-                 .tuples())
-        self.assertEqual([row for row, in query], ['{}'] * 5)
-
-        Clone = APIData.alias()
-        query = (APIData
-                 .update(
-                     data=(Clone
-                           .select(Clone.data.remove('metadata.tags[2]'))
-                           .where(Clone.id == APIData.id)))
-                 .where(
-                     APIData.value.contains('LSM Storage') |
-                     APIData.value.contains('UnQLite Python')))
-        result = query.execute()
-        self.assertEqual(result, 2)
-
-        tag_len = (self.Q
-                   .columns(APIData.data.length('metadata.tags').alias('len'))
-                   .dicts())
-        self.assertEqual(list(tag_len), [
-            {'len': 2},
-            {'len': 3},
-            {'len': 4},
-            {'len': 3},
-            {'len': 4},
-        ])
+        self.assertRows((KeyData.data['k1'] == 'v1'), ['a', 'c'])
+        self.assertRows((KeyData.data['k2'] == 'v2'), ['b', 'c'])
+        self.assertRows((KeyData.data['x1']['y1'] == 'z1'), ['a', 'd'])
+        self.assertRows((KeyData.data['l1'][1] == 1), ['e'])
+        self.assertRows((KeyData.data['l2'][1][1] == 3), ['e'])
 
     def test_set(self):
-        query = (self.Q
-                 .columns(
-                     fn.json_extract(
-                         APIData.data.set(
-                             'metadata',
-                             {'k1': {'k2': 'bar'}}),
-                         '$.metadata.k1'))
-                 .tuples())
-        self.assertEqual(
-            [json.loads(row) for row, in query],
-            [{'k2': 'bar'}] * 5)
+        query = (KeyData
+                 .update({KeyData.data: KeyData.data['k1'].set('v1-x')})
+                 .where(KeyData.data['k1'] == 'v1'))
+        self.assertEqual(query.execute(), 2)
+        self.assertRows((KeyData.data['k1'] == 'v1-x'), ['a', 'c'])
 
-        Clone = APIData.alias()
-        query = (APIData
-                 .update(
-                     data=(Clone
-                           .select(Clone.data.set('title', 'hello'))
-                           .where(Clone.id == APIData.id)))
-                 .where(APIData.value.contains('LSM Storage'))
+        self.assertData('a', {'k1': 'v1-x', 'x1': {'y1': 'z1'}})
+
+    def test_set_json(self):
+        set_json = KeyData.data['x1'].set({'y1': 'z1-x', 'y3': 'z3'})
+        query = (KeyData
+                 .update({KeyData.data: set_json})
+                 .where(KeyData.data['x1']['y1'] == 'z1'))
+        self.assertEqual(query.execute(), 2)
+        self.assertRows((KeyData.data['x1']['y1'] == 'z1-x'), ['a', 'd'])
+
+        self.assertData('a', {'k1': 'v1', 'x1': {'y1': 'z1-x', 'y3': 'z3'}})
+        self.assertData('d', {'x1': {'y1': 'z1-x', 'y3': 'z3'}})
+
+    def test_update(self):
+        merged = KeyData.data.update({'x1': {'y1': 'z1-x', 'y3': 'z3'}})
+        query = (KeyData
+                 .update({KeyData.data: merged})
+                 .where(KeyData.data['x1']['y1'] == 'z1'))
+        self.assertEqual(query.execute(), 2)
+        self.assertRows((KeyData.data['x1']['y1'] == 'z1-x'), ['a', 'd'])
+
+        self.assertData('a', {'k1': 'v1', 'x1': {'y1': 'z1-x', 'y3': 'z3'}})
+        self.assertData('d', {'x1': {'y1': 'z1-x', 'y2': 'z2', 'y3': 'z3'}})
+
+    def test_update_with_removal(self):
+        m = KeyData.data.update({'k1': None, 'x1': {'y1': None, 'y3': 'z3'}})
+        query = KeyData.update(data=m).where(KeyData.data['x1']['y1'] == 'z1')
+        self.assertEqual(query.execute(), 2)
+        self.assertRows((KeyData.data['x1']['y3'] == 'z3'), ['a', 'd'])
+
+        self.assertData('a', {'x1': {'y3': 'z3'}})
+        self.assertData('d', {'x1': {'y2': 'z2', 'y3': 'z3'}})
+
+    def test_update_nested(self):
+        merged = KeyData.data['x1'].update({'y1': 'z1-x', 'y3': 'z3'})
+        query = (KeyData
+                 .update(data=merged)
+                 .where(KeyData.data['x1']['y1'] == 'z1'))
+        self.assertEqual(query.execute(), 2)
+        self.assertRows((KeyData.data['x1']['y1'] == 'z1-x'), ['a', 'd'])
+
+        self.assertData('a', {'k1': 'v1', 'x1': {'y1': 'z1-x', 'y3': 'z3'}})
+        self.assertData('d', {'x1': {'y1': 'z1-x', 'y2': 'z2', 'y3': 'z3'}})
+
+    def test_updated_nested_with_removal(self):
+        merged = KeyData.data['x1'].update({'o1': 'p1', 'y1': None})
+        nrows = (KeyData
+                 .update(data=merged)
+                 .where(KeyData.data['x1']['y1'] == 'z1')
                  .execute())
-        self.assertEqual(query, 1)
+        self.assertRows((KeyData.data['x1']['o1'] == 'p1'), ['a', 'd'])
+        self.assertData('a', {'k1': 'v1', 'x1': {'o1': 'p1'}})
+        self.assertData('d', {'x1': {'o1': 'p1', 'y2': 'z2'}})
 
-        titles = self.Q.columns(APIData.data.extract('title')).tuples()
-        for idx, (row,) in enumerate(titles):
-            if idx == 1:
-                self.assertEqual(row, 'hello')
-            else:
-                self.assertNotEqual(row, 'hello')
+    def test_remove(self):
+        query = (KeyData
+                 .update(data=KeyData.data['k1'].remove())
+                 .where(KeyData.data['k1'] == 'v1'))
+        self.assertEqual(query.execute(), 2)
 
-    def test_multi_set(self):
-        Clone = APIData.alias()
-        set_query = (Clone
-                     .select(Clone.data.set(
-                         'foo', 'foo value',
-                         'tagz', ['list', 'of', 'tags'],
-                         'x.y.z', 3,
-                         'metadata.foo', None,
-                         'bar.baze', True))
-                     .where(Clone.id == APIData.id))
-        query = (APIData
-                 .update(data=set_query)
-                 .where(APIData.value.contains('LSM Storage'))
+        self.assertData('a', {'x1': {'y1': 'z1'}})
+        self.assertData('c', {'k2': 'v2'})
+
+        nrows = (KeyData
+                 .update(data=KeyData.data['l2'][1][1].remove())
+                 .where(KeyData.key == 'e')
                  .execute())
-        self.assertEqual(query, 1)
+        self.assertData('e', {'l1': [0, 1, 2], 'l2': [1, [3], 7]})
 
-        result = APIData.select().where(APIData.value.contains('LSM storage')).get()
-        self.assertEqual(result.data, {
-            'bar': {'baze': 1},
-            'foo': 'foo value',
-            'metadata': {'tags': ['nosql', 'python', 'sqlite', 'cython'], 'foo': None},
-            'tagz': ['list', 'of', 'tags'],
-            'title': 'Using SQLite4\'s LSM Storage Engine as a Stand-alone NoSQL Database with Python',
-            'url': 'http://charlesleifer.com/blog/using-sqlite4-s-lsm-storage-engine-as-a-stand-alone-nosql-database-with-python/',
-            'x': {'y': {'z': 3}},
-        })
+    def test_simple_update(self):
+        nrows = (KeyData
+                 .update(data={'foo': 'bar'})
+                 .where(KeyData.key.in_(['a', 'b']))
+                 .execute())
+        for k in self.Q.where(KeyData.key.in_(['a', 'b'])):
+            self.assertEqual(k.data, {'foo': 'bar'})
 
-    def test_children(self):
-        children = APIData.data.children().alias('children')
-        query = (APIData
-                 .select(children.c.value.alias('value'))
-                 .from_(APIData, children)
-                 .where(children.c.key.in_(['title', 'url']))
+    def test_tree(self):
+        tree = KeyData.data.tree().alias('tree')
+        query = (KeyData
+                 .select(tree.c.fullkey.alias('fullkey'))
+                 .from_(KeyData, tree)
+                 .where(KeyData.key == 'd')
                  .order_by(SQL('1'))
                  .tuples())
-        self.assertEqual([row for row, in query], [
-            'Alternative Redis-Like Databases with Python',
-            'Building the SQLite FTS5 Search Extension',
-            'Introduction to the fast new UnQLite Python Bindings',
-            'My List of Python and SQLite Resources',
-            'Using SQLite4\'s LSM Storage Engine as a Stand-alone NoSQL Database with Python',
-            'http://charlesleifer.com/blog/alternative-redis-like-databases-with-python/',
-            'http://charlesleifer.com/blog/building-the-sqlite-fts5-search-extension/',
-            'http://charlesleifer.com/blog/introduction-to-the-fast-new-unqlite-python-bindings/',
-            'http://charlesleifer.com/blog/my-list-of-python-and-sqlite-resources/',
-            'http://charlesleifer.com/blog/using-sqlite4-s-lsm-storage-engine-as-a-stand-alone-nosql-database-with-python/',
-        ])
-
-    test_metadata = [
-        {'filename': 'peewee.py', 'size': 200000, 'mimetype': 'text/python',
-         'tags': ['peewee', 'main', 'python'],
-         'metadata': {'modified': '2018-02-01 13:37:00', 'perms': 'rw'}},
-        {'filename': 'runtests.py', 'size': 2300, 'mimetype': 'text/python',
-         'tags': ['tests', 'peewee', 'python'],
-         'metadata': {'modified': '2018-01-02 00:00:00', 'perms': 'rwx'}},
-        {'filename': 'playhouse/sqlite_ext.py', 'size': 41000,
-         'mimetype': 'text/python', 'tags': ['sqlite', 'peewee', 'python'],
-         'metadata': {'modified': '2018-02-01 14:01:00', 'perms': 'rw'}},
-    ]
-
-    @requires_models(Metadata)
-    def test_json_path(self):
-        with self.database.atomic():
-            for metadata in self.test_metadata:
-                Metadata.create(data=metadata)
-
-        query = (Metadata
-                 .select(Metadata.data.extract(J.tags[0]).alias('tag'),
-                         Metadata.data[J.filename].alias('filename'),
-                         Metadata.data[J.metadata.perms].alias('perms'))
-                 .order_by(fn.json_extract(Metadata.data, J['filename']))
-                 .namedtuples())
-        self.assertSQL(query, (
-            'SELECT json_extract("t1"."data", ?) AS "tag", '
-            'json_extract("t1"."data", ?) AS "filename", '
-            'json_extract("t1"."data", ?) AS "perms" '
-            'FROM "metadata" AS "t1" '
-            'ORDER BY json_extract("t1"."data", ?)'),
-            ['$.tags[0]', '$.filename', '$.metadata.perms', '$.filename'])
-        accum = [(row.filename, row.tag, row.perms) for row in query]
-        self.assertEqual(accum, [
-            ('peewee.py', 'peewee', 'rw'),
-            ('playhouse/sqlite_ext.py', 'sqlite', 'rw'),
-            ('runtests.py', 'tests', 'rwx')])
-
-        n = (Metadata
-             .update(data=Metadata.data.set(
-                 J.metadata.modified, '2018-02-01 15:00:00',
-                 J['metadata']['misc'], 1337))
-             .where(Metadata.data[J.tags[0]] != 'tests')
-             .execute())
-        self.assertEqual(n, 2)
-
-        peewee = Metadata.get(Metadata.data[J.filename] == 'peewee.py')
-        self.assertEqual(peewee.data['metadata']['modified'],
-                         '2018-02-01 15:00:00')
-        self.assertEqual(peewee.data['metadata']['misc'], 1337)
+        self.assertEqual([fullkey for fullkey, in query], [
+            '$',
+            '$.x1',
+            '$.x1.y1',
+            '$.x1.y2'])
 
 
 class TestSqliteExtensions(BaseTestCase):
@@ -565,6 +521,7 @@ class TestSqliteExtensions(BaseTestCase):
             class Meta:
                 database = database
                 extension_module = 'ext1337'
+                legacy_table_names = False
                 options = {'huey': 'cat', 'mickey': 'dog'}
                 primary_key = False
 
@@ -575,7 +532,7 @@ class TestSqliteExtensions(BaseTestCase):
             'USING ext1337 '
             '(huey=cat, mickey=dog)'), [])
         self.assertSQL(SubTest._schema._create_table(), (
-            'CREATE VIRTUAL TABLE IF NOT EXISTS "subtest" '
+            'CREATE VIRTUAL TABLE IF NOT EXISTS "sub_test" '
             'USING ext1337 '
             '(huey=cat, mickey=dog)'), [])
         self.assertSQL(
@@ -591,7 +548,7 @@ class TestSqliteExtensions(BaseTestCase):
                 database = database
 
         self.assertSQL(AutoIncrement._schema._create_table(), (
-            'CREATE TABLE IF NOT EXISTS "autoincrement" '
+            'CREATE TABLE IF NOT EXISTS "auto_increment" '
             '("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, '
             '"data" TEXT NOT NULL)'), [])
 
@@ -871,7 +828,7 @@ class TestFullTextSearch(ModelTestCase):
             (2, 0.85)])
 
 
-@skip_case_unless(CYTHON_EXTENSION)
+@skip_unless(CYTHON_EXTENSION, 'requires sqlite c extension')
 class TestFullTextSearchCython(TestFullTextSearch):
     database = SqliteExtDatabase(':memory:', c_extensions=CYTHON_EXTENSION)
 
@@ -929,7 +886,7 @@ class TestFullTextSearchCython(TestFullTextSearch):
             (0.049, 'Faith consists')], sort_cleaned=True)
 
 
-@skip_case_unless(CYTHON_EXTENSION)
+@skip_unless(CYTHON_EXTENSION, 'requires sqlite c extension')
 class TestMurmurHash(ModelTestCase):
     database = SqliteExtDatabase(':memory:', c_extensions=CYTHON_EXTENSION,
                                  hash_functions=True)
@@ -947,7 +904,7 @@ class TestMurmurHash(ModelTestCase):
         self.assertHash('this is a test of a longer string', 2569735385)
         self.assertHash(None, None)
 
-    @skip_if(sys.version_info[0] == 3)
+    @skip_if(sys.version_info[0] == 3, 'requres python 2')
     def test_checksums(self):
         self.assertHash('testkey', -225678656, 'crc32')
         self.assertHash('murmur', 1507884895, 'crc32')
@@ -1038,6 +995,16 @@ class TestUserDefinedCallbacks(ModelTestCase):
         self.assertEqual([x[0] for x in pq.tuples()], [
             'testing', 'chatting', '  foo'])
 
+    def test_use_across_connections(self):
+        db = get_in_memory_db()
+        @db.func()
+        def rev(s):
+            return s[::-1]
+
+        db.connect(); db.close(); db.connect()
+        curs = db.execute_sql('select rev(?)', ('hello',))
+        self.assertEqual(curs.fetchone(), ('olleh',))
+
 
 class TestRowIDField(ModelTestCase):
     database = database
@@ -1060,7 +1027,7 @@ class TestRowIDField(ModelTestCase):
         query = RowIDModel.select().where(RowIDModel.rowid == 2)
         self.assertSQL(query, (
             'SELECT "t1"."rowid", "t1"."data" '
-            'FROM "rowidmodel" AS "t1" '
+            'FROM "row_id_model" AS "t1" '
             'WHERE ("t1"."rowid" = ?)'), [2])
         r_db = query.get()
         self.assertEqual(r_db.rowid, 2)
@@ -1124,7 +1091,7 @@ class BaseExtModel(TestModel):
         database = database
 
 
-@skip_case_unless(CLOSURE_EXTENSION)
+@skip_unless(CLOSURE_EXTENSION, 'requires closure table extension')
 class TestTransitiveClosureManyToMany(BaseTestCase):
     def setUp(self):
         super(TestTransitiveClosureManyToMany, self).setUp()
@@ -1179,7 +1146,8 @@ class TestTransitiveClosureManyToMany(BaseTestCase):
         assertPeople(PC.siblings(z), [])
 
 
-@skip_case_unless(CLOSURE_EXTENSION and os.path.exists(CLOSURE_EXTENSION))
+@skip_unless(CLOSURE_EXTENSION and os.path.exists(CLOSURE_EXTENSION),
+             'requires closure extension')
 class TestTransitiveClosureIntegration(BaseTestCase):
     tree = {
         'books': [
@@ -1370,7 +1338,7 @@ class TestTransitiveClosureIntegration(BaseTestCase):
         database.drop_tables([Node, NodeClosure])
 
 
-@skip_case_unless(FTS5Model.fts5_installed)
+@skip_unless(FTS5Model.fts5_installed(), 'requires fts5')
 class TestFTS5(ModelTestCase):
     database = database
     requires = [FTS5Test]
@@ -1388,7 +1356,7 @@ class TestFTS5(ModelTestCase):
     def test_create_table(self):
         query = FTS5Test._schema._create_table()
         self.assertSQL(query, (
-            'CREATE VIRTUAL TABLE IF NOT EXISTS "fts5test" USING fts5 '
+            'CREATE VIRTUAL TABLE IF NOT EXISTS "fts5_test" USING fts5 '
             '("title", "data", "misc" UNINDEXED)'), [])
 
     def test_create_table_options(self):
@@ -1424,8 +1392,8 @@ class TestFTS5(ModelTestCase):
         query = FTS5Test.search('bb')
         self.assertSQL(query, (
             'SELECT "t1"."rowid", "t1"."title", "t1"."data", "t1"."misc" '
-            'FROM "fts5test" AS "t1" '
-            'WHERE ("fts5test" MATCH ?) ORDER BY rank'), ['bb'])
+            'FROM "fts5_test" AS "t1" '
+            'WHERE ("fts5_test" MATCH ?) ORDER BY rank'), ['bb'])
         self.assertResults(query, ['nug aa dd', 'foo aa bb', 'bar bb cc'])
 
 
@@ -1459,7 +1427,8 @@ class KVI(LSMTable):
         filename = 'test_lsm.ldb'
 
 
-@skip_case_unless(LSM_EXTENSION and os.path.exists(LSM_EXTENSION))
+@skip_unless(LSM_EXTENSION and os.path.exists(LSM_EXTENSION),
+             'requires lsm1 sqlite extension')
 class TestLSM1Extension(BaseTestCase):
     def setUp(self):
         super(TestLSM1Extension, self).setUp()
@@ -1584,7 +1553,7 @@ class TestLSM1Extension(BaseTestCase):
         self.assertEqual(keys, [96, 97, 98, 99])
 
 
-@skip_case_unless(json_installed)
+@skip_unless(json_installed(), 'requires json1 sqlite extension')
 class TestJsonContains(ModelTestCase):
     database = SqliteExtDatabase(':memory:', json_contains=True)
     requires = [KeyData]
@@ -1658,3 +1627,129 @@ class TestJsonContains(ModelTestCase):
 
         self.assertContains({'x1': {'y2': 'z2', 'y3': [0, 1, 2, 4]}}, [])
         self.assertContains({'x1': {'y2': 'z2', 'y3': [0, 2]}}, [])
+
+
+class CalendarMonth(TestModel):
+    name = TextField()
+    value = IntegerField()
+
+class CalendarDay(TestModel):
+    month = ForeignKeyField(CalendarMonth, backref='days')
+    value = IntegerField()
+
+
+class TestIntWhereChain(ModelTestCase):
+    database = database
+    requires = [CalendarMonth, CalendarDay]
+
+    def test_int_where_chain(self):
+        with self.database.atomic():
+            jan = CalendarMonth.create(name='january', value=1)
+            feb = CalendarMonth.create(name='february', value=2)
+            CalendarDay.insert_many([{'month': jan, 'value': i + 1}
+                                     for i in range(31)]).execute()
+            CalendarDay.insert_many([{'month': feb, 'value': i + 1}
+                                     for i in range(28)]).execute()
+
+        def assertValues(query, expected):
+            self.assertEqual(sorted([d.value for d in query]), list(expected))
+
+        q = CalendarDay.select().join(CalendarMonth)
+        jq = q.where(CalendarMonth.name == 'january')
+        jq1 = jq.where(CalendarDay.value >= 25)
+        assertValues(jq1, range(25, 32))
+
+        jq2 = jq1.where(CalendarDay.value < 30)
+        assertValues(jq2, range(25, 30))
+
+        fq = q.where(CalendarMonth.name == 'february')
+        fq1 = fq.where(CalendarDay.value >= 25)
+        assertValues(fq1, range(25, 29))
+
+        fq2 = fq1.where(CalendarDay.value < 30)
+        assertValues(fq2, range(25, 29))
+
+
+class Datum(TestModel):
+    a = BareField()
+    b = BareField(collation='BINARY')
+    c = BareField(collation='RTRIM')
+    d = BareField(collation='NOCASE')
+
+
+class TestCollatedFieldDefinitions(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [Datum]
+
+    def test_collated_fields(self):
+        rows = (
+            (1, 'abc', 'abc',  'abc  ', 'abc'),
+            (2, 'abc', 'abc',  'abc',   'ABC'),
+            (3, 'abc', 'abc',  'abc ',  'Abc'),
+            (4, 'abc', 'abc ', 'ABC',   'abc'))
+        for pk, a, b, c, d in rows:
+            Datum.create(id=pk, a=a, b=b, c=c, d=d)
+
+        def assertC(query, expected):
+            self.assertEqual([r.id for r in query], expected)
+
+        base = Datum.select().order_by(Datum.id)
+
+        # Text comparison a=b is performed using binary collating sequence.
+        assertC(base.where(Datum.a == Datum.b), [1, 2, 3])
+
+        # Text comparison a=b is performed using the RTRIM collating sequence.
+        assertC(base.where(Datum.a == Datum.b.collate('RTRIM')), [1, 2, 3, 4])
+
+        # Text comparison d=a is performed using the NOCASE collating sequence.
+        assertC(base.where(Datum.d == Datum.a), [1, 2, 3, 4])
+
+        # Text comparison a=d is performed using the BINARY collating sequence.
+        assertC(base.where(Datum.a == Datum.d), [1, 4])
+
+        # Text comparison 'abc'=c is performed using RTRIM collating sequence.
+        assertC(base.where('abc' == Datum.c), [1, 2, 3])
+
+        # Text comparison c='abc' is performed using RTRIM collating sequence.
+        assertC(base.where(Datum.c == 'abc'), [1, 2, 3])
+
+        # Grouping is performed using the NOCASE collating sequence (Values
+        # 'abc', 'ABC', and 'Abc' are placed in the same group).
+        query = Datum.select(fn.COUNT(Datum.id)).group_by(Datum.d)
+        self.assertEqual(query.scalar(), 4)
+
+        # Grouping is performed using the BINARY collating sequence.  'abc' and
+        # 'ABC' and 'Abc' form different groups.
+        query = Datum.select(fn.COUNT(Datum.id)).group_by(Datum.d.concat(''))
+        self.assertEqual([r[0] for r in query.tuples()], [1, 1, 2])
+
+        # Sorting or column c is performed using the RTRIM collating sequence.
+        assertC(base.order_by(Datum.c, Datum.id), [4, 1, 2, 3])
+
+        # Sorting of (c||'') is performed using the BINARY collating sequence.
+        assertC(base.order_by(Datum.c.concat(''), Datum.id), [4, 2, 3, 1])
+
+        # Sorting of column c is performed using the NOCASE collating sequence.
+        assertC(base.order_by(Datum.c.collate('NOCASE'), Datum.id),
+                [2, 4, 3, 1])
+
+
+class TestReadOnly(ModelTestCase):
+    database = db_loader('sqlite3')
+
+    @skip_if(sys.version_info < (3, 4, 0), 'requres python >= 3.4.0')
+    @requires_models(User)
+    def test_read_only(self):
+        User.create(username='foo')
+
+        db_filename = self.database.database
+        db = SqliteDatabase('file:%s?mode=ro' % db_filename, uri=True)
+        cursor = db.execute_sql('select username from users')
+        self.assertEqual(cursor.fetchone(), ('foo',))
+
+        self.assertRaises(OperationalError, db.execute_sql,
+                          'insert into users (username) values (?)', ('huey',))
+
+        # We cannot create a database if in read-only mode.
+        db = SqliteDatabase('file:xx_not_exists.db?mode=ro', uri=True)
+        self.assertRaises(OperationalError, db.connect)

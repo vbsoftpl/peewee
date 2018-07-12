@@ -5,12 +5,15 @@ from random import randint
 cimport cython
 from cpython cimport datetime
 from cpython.bytes cimport PyBytes_AsStringAndSize
+from cpython.bytes cimport PyBytes_Check
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.bytes cimport PyBytes_AS_STRING
 from cpython.mem cimport PyMem_Free
 from cpython.mem cimport PyMem_Malloc
 from cpython.object cimport PyObject
 from cpython.ref cimport Py_INCREF, Py_DECREF
+from cpython.unicode cimport PyUnicode_AsUTF8String
+from cpython.unicode cimport PyUnicode_Check
 from libc.float cimport DBL_MAX
 from libc.math cimport ceil, log, sqrt
 from libc.math cimport pow as cpow
@@ -24,6 +27,8 @@ from peewee import InterfaceError
 from peewee import Node
 from peewee import OperationalError
 from peewee import sqlite3 as pysqlite
+
+import traceback
 
 
 cdef struct sqlite3_index_constraint:
@@ -43,7 +48,7 @@ cdef struct sqlite3_index_constraint_usage:
     unsigned char omit
 
 
-cdef extern from "sqlite3.h":
+cdef extern from "sqlite3.h" nogil:
     ctypedef struct sqlite3:
         int busyTimeout
     ctypedef struct sqlite3_backup
@@ -118,7 +123,15 @@ cdef extern from "sqlite3.h":
     # Return values.
     cdef int SQLITE_OK = 0
     cdef int SQLITE_ERROR = 1
+    cdef int SQLITE_INTERNAL = 2
+    cdef int SQLITE_PERM = 3
+    cdef int SQLITE_ABORT = 4
+    cdef int SQLITE_BUSY = 5
+    cdef int SQLITE_LOCKED = 6
     cdef int SQLITE_NOMEM = 7
+    cdef int SQLITE_READONLY = 8
+    cdef int SQLITE_INTERRUPT = 9
+    cdef int SQLITE_DONE = 101
 
     # Function type.
     cdef int SQLITE_DETERMINISTIC = 0x800
@@ -342,7 +355,14 @@ cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
     memset(<char *>pCur, 0, sizeof(pCur[0]))
     ppCursor[0] = &(pCur.base)
     pCur.idx = 0
-    table_func = table_func_cls()
+    try:
+        table_func = table_func_cls()
+    except:
+        if table_func_cls.print_tracebacks:
+            traceback.print_exc()
+        sqlite3_free(pCur)
+        return SQLITE_ERROR
+
     Py_INCREF(table_func)
     pCur.table_func = <void *>table_func
     pCur.stopped = False
@@ -369,11 +389,14 @@ cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
     if pCur.row_data:
         Py_DECREF(<tuple>pCur.row_data)
 
+    pCur.row_data = NULL
     try:
-        result = table_func.iterate(pCur.idx)
+        result = tuple(table_func.iterate(pCur.idx))
     except StopIteration:
         pCur.stopped = True
     except:
+        if table_func.print_tracebacks:
+            traceback.print_exc()
         return SQLITE_ERROR
     else:
         Py_INCREF(result)
@@ -396,6 +419,10 @@ cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
     if iCol == -1:
         sqlite3_result_int64(ctx, <sqlite3_int64>pCur.idx)
         return SQLITE_OK
+
+    if not pCur.row_data:
+        sqlite3_result_error(ctx, encode('no row data'), -1)
+        return SQLITE_ERROR
 
     row_data = <tuple>pCur.row_data
     value = row_data[iCol]
@@ -481,12 +508,22 @@ cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
         else:
             query[param] = None
 
-    table_func.initialize(**query)
+    try:
+        table_func.initialize(**query)
+    except:
+        if table_func.print_tracebacks:
+            traceback.print_exc()
+        return SQLITE_ERROR
+
     pCur.stopped = False
     try:
-        row_data = table_func.iterate(0)
+        row_data = tuple(table_func.iterate(0))
     except StopIteration:
         pCur.stopped = True
+    except:
+        if table_func.print_tracebacks:
+            traceback.print_exc()
+        return SQLITE_ERROR
     else:
         Py_INCREF(row_data)
         pCur.row_data = <void *>row_data
@@ -597,6 +634,7 @@ class TableFunction(object):
     columns = None
     params = None
     name = None
+    print_tracebacks = True
     _ncols = None
 
     @classmethod
@@ -669,19 +707,27 @@ cdef tuple validate_and_format_datetime(lookup, date_str):
 
 cdef inline bytes encode(key):
     cdef bytes bkey
-    if isinstance(key, unicode):
-        bkey = <bytes>key.encode('utf-8')
-    else:
+    if PyUnicode_Check(key):
+        bkey = PyUnicode_AsUTF8String(key)
+    elif PyBytes_Check(key):
         bkey = <bytes>key
+    elif key is None:
+        return None
+    else:
+        bkey = PyUnicode_AsUTF8String(str(key))
     return bkey
 
 
 cdef inline unicode decode(key):
     cdef unicode ukey
-    if isinstance(key, bytes):
+    if PyBytes_Check(key):
         ukey = key.decode('utf-8')
+    elif PyUnicode_Check(key):
+        ukey = <unicode>key
+    elif key is None:
+        return None
     else:
-        ukey = key
+        ukey = unicode(key)
     return ukey
 
 
@@ -732,7 +778,7 @@ def peewee_lucene(py_match_info, *raw_weights):
         char *match_info_buf = _match_info_buf
         int argc = len(raw_weights)
         int term_count, col_count
-        double total_docs, term_frequency,
+        double total_docs, term_frequency
         double doc_length, docs_with_term, avg_length
         double idf, weight, rhs, denom
         double *weights
@@ -788,7 +834,7 @@ def peewee_bm25(py_match_info, *raw_weights):
         int argc = len(raw_weights)
         int term_count, col_count
         double B = 0.75, K = 1.2, D
-        double total_docs, term_frequency,
+        double total_docs, term_frequency
         double doc_length, docs_with_term, avg_length
         double idf, weight, rhs, denom
         double *weights
@@ -955,13 +1001,8 @@ def peewee_murmurhash(key, seed=None):
         return
 
     cdef:
-        bytes bkey
+        bytes bkey = encode(key)
         int nseed = seed or 0
-
-    if isinstance(key, unicode):
-        bkey = <bytes>key.encode('utf-8')
-    else:
-        bkey = <bytes>key
 
     if key:
         return murmurhash2(<unsigned char *>bkey, len(bkey), nseed)
@@ -1124,11 +1165,7 @@ def peewee_bloomfilter_contains(key, data):
 
     bf.size = len(data)
     bf.bits = <void *>cdata
-
-    if isinstance(key, unicode):
-        bkey = <bytes>key.encode('utf-8')
-    else:
-        bkey = <bytes>key
+    bkey = encode(key)
 
     return bf_contains(&bf, <unsigned char *>bkey)
 
@@ -1365,12 +1402,12 @@ cdef class ConnectionHelper(object):
         else:
             sqlite3_update_hook(self.conn.db, _update_callback, <void *>fn)
 
-    def set_busy_handler(self, timeout=5000):
+    def set_busy_handler(self, timeout=5):
         """
         Replace the default busy handler with one that introduces some "jitter"
         into the amount of time delayed between checks.
         """
-        cdef int n = timeout
+        cdef int n = timeout * 1000
         sqlite3_busy_handler(self.conn.db, _aggressive_busy_handler, <void *>n)
         return True
 
@@ -1420,37 +1457,59 @@ cdef void _update_callback(void *userData, int queryType, char *database,
         query = 'DELETE'
     else:
         query = ''
-    fn(query, database.decode('utf-8'), table.decode('utf-8'), <int>rowid)
+    fn(query, decode(database), decode(table), <int>rowid)
 
 
-def backup(src_conn, dest_conn):
+def backup(src_conn, dest_conn, pages=None, name=None, progress=None):
     cdef:
+        bytes bname = encode(name or 'main')
+        int page_step = pages or -1
+        int rc
         pysqlite_Connection *src = <pysqlite_Connection *>src_conn
         pysqlite_Connection *dest = <pysqlite_Connection *>dest_conn
         sqlite3 *src_db = src.db
         sqlite3 *dest_db = dest.db
         sqlite3_backup *backup
 
-    backup = sqlite3_backup_init(dest_db, 'main', src_db, 'main')
-    if (backup == NULL):
+    # We always backup to the "main" database in the dest db.
+    backup = sqlite3_backup_init(dest_db, b'main', src_db, bname)
+    if backup == NULL:
         raise OperationalError('Unable to initialize backup.')
 
-    sqlite3_backup_step(backup, -1)
-    sqlite3_backup_finish(backup)
+    while True:
+        with nogil:
+            rc = sqlite3_backup_step(backup, page_step)
+        if progress is not None:
+            # Progress-handler is called with (remaining, page count, is done?)
+            remaining = sqlite3_backup_remaining(backup)
+            page_count = sqlite3_backup_pagecount(backup)
+            try:
+                progress(remaining, page_count, rc == SQLITE_DONE)
+            except:
+                sqlite3_backup_finish(backup)
+                raise
+        if rc == SQLITE_BUSY or rc == SQLITE_LOCKED:
+            with nogil:
+                sqlite3_sleep(250)
+        elif rc == SQLITE_DONE:
+            break
+
+    with nogil:
+        sqlite3_backup_finish(backup)
     if sqlite3_errcode(dest_db):
-        raise OperationalError('Error finishing backup: %s' %
+        raise OperationalError('Error backuping up database: %s' %
                                sqlite3_errmsg(dest_db))
     return True
 
 
-def backup_to_file(src_conn, filename):
+def backup_to_file(src_conn, filename, pages=None, name=None, progress=None):
     dest_conn = pysqlite.connect(filename)
-    backup(src_conn, dest_conn)
+    backup(src_conn, dest_conn, pages=pages, name=name, progress=progress)
     dest_conn.close()
     return True
 
 
-cdef int _aggressive_busy_handler(void *ptr, int n):
+cdef int _aggressive_busy_handler(void *ptr, int n) nogil:
     # In concurrent environments, it often seems that if multiple queries are
     # kicked off at around the same time, they proceed in lock-step to check
     # for the availability of the lock. By introducing some "jitter" we can

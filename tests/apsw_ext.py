@@ -20,9 +20,41 @@ class Message(TestModel):
     published = BooleanField()
 
 
+class VTSource(object):
+    def Create(self, db, modulename, dbname, tablename, *args):
+        schema = 'CREATE TABLE x(value)'
+        return schema, VTable()
+    Connect = Create
+class VTable(object):
+    def BestIndex(self, *args):
+        return
+    def Open(self):
+        return VTCursor()
+    def Disconnect(self): pass
+    Destroy = Disconnect
+class VTCursor(object):
+    def Filter(self, *a):
+        self.val = 0
+    def Eof(self): return False
+    def Rowid(self):
+        return self.val
+    def Column(self, col):
+        return self.val
+    def Next(self):
+        self.val += 1
+    def Close(self): pass
+
+
 class TestAPSWExtension(ModelTestCase):
     database = database
     requires = [User, Message]
+
+    def test_db_register_module(self):
+        database.register_module('series', VTSource())
+        database.execute_sql('create virtual table foo using series()')
+        curs = database.execute_sql('select * from foo limit 5;')
+        self.assertEqual([v for v, in curs], [0, 1, 2, 3, 4])
+        database.unregister_module('series')
 
     def test_db_register_function(self):
         @database.func()
@@ -31,6 +63,43 @@ class TestAPSWExtension(ModelTestCase):
 
         curs = self.database.execute_sql('SELECT title(?)', ('heLLo',))
         self.assertEqual(curs.fetchone()[0], 'Hello')
+
+    def test_db_register_aggregate(self):
+        @database.aggregate()
+        class First(object):
+            def __init__(self):
+                self._value = None
+
+            def step(self, value):
+                if self._value is None:
+                    self._value = value
+
+            def finalize(self):
+                return self._value
+
+        with database.atomic():
+            for i in range(10):
+                User.create(username='u%s' % i)
+
+        query = User.select(fn.First(User.username)).order_by(User.username)
+        self.assertEqual(query.scalar(), 'u0')
+
+    def test_db_register_collation(self):
+        @database.collation()
+        def reverse(lhs, rhs):
+            lhs, rhs = lhs.lower(), rhs.lower()
+            if lhs < rhs:
+                return 1
+            return -1 if rhs > lhs else 0
+
+        with database.atomic():
+            for i in range(3):
+                User.create(username='u%s' % i)
+
+        query = (User
+                 .select(User.username)
+                 .order_by(User.username.collate('reverse')))
+        self.assertEqual([u.username for u in query], ['u2', 'u1', 'u0'])
 
     def test_db_pragmas(self):
         test_db = APSWDatabase(':memory:', pragmas=(

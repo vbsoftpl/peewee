@@ -7,7 +7,9 @@ from playhouse.reflection import *
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db
-from .base import skip_unless
+from .base import requires_sqlite
+from .base_models import Tweet
+from .base_models import User
 
 
 class ColTypes(TestModel):
@@ -61,23 +63,25 @@ class Nugget(TestModel):
     category = CharField()
 
 
-class TestReflection(ModelTestCase):
+class BaseReflectionTestCase(ModelTestCase):
+    def setUp(self):
+        super(BaseReflectionTestCase, self).setUp()
+        self.introspector = Introspector.from_database(self.database)
+
+
+class TestReflection(BaseReflectionTestCase):
     requires = [ColTypes, Nullable, RelModel, FKPK, Underscores, Category,
                 Nugget]
-
-    def setUp(self):
-        super(TestReflection, self).setUp()
-        self.introspector = Introspector.from_database(self.database)
 
     def test_generate_models(self):
         models = self.introspector.generate_models()
         self.assertTrue(set((
             'category',
-            'coltypes',
+            'col_types',
             'fkpk',
             'nugget',
             'nullable',
-            'relmodel',
+            'rel_model',
             'underscores')).issubset(set(models)))
 
         def assertIsInstance(obj, klass):
@@ -95,10 +99,10 @@ class TestReflection(ModelTestCase):
         fkpk = models['fkpk']
         self.assertEqual(sorted(fkpk._meta.fields), ['col_types'])
         assertIsInstance(fkpk.col_types, ForeignKeyField)
-        self.assertEqual(fkpk.col_types.rel_model, models['coltypes'])
+        self.assertEqual(fkpk.col_types.rel_model, models['col_types'])
         self.assertTrue(fkpk.col_types.primary_key)
 
-        relmodel = models['relmodel']
+        relmodel = models['rel_model']
         self.assertEqual(
             sorted(relmodel._meta.fields),
             ['col_types', 'col_types_nullable', 'id'])
@@ -107,19 +111,19 @@ class TestReflection(ModelTestCase):
         self.assertFalse(relmodel.col_types.null)
         self.assertTrue(relmodel.col_types_nullable.null)
         self.assertEqual(relmodel.col_types.rel_model,
-                         models['coltypes'])
+                         models['col_types'])
         self.assertEqual(relmodel.col_types_nullable.rel_model,
-                         models['coltypes'])
+                         models['col_types'])
 
-    @skip_unless(isinstance(db, SqliteDatabase))
+    @requires_sqlite
     def test_generate_models_indexes(self):
         models = self.introspector.generate_models()
 
         self.assertEqual(models['fkpk']._meta.indexes, [])
-        self.assertEqual(models['relmodel']._meta.indexes, [])
+        self.assertEqual(models['rel_model']._meta.indexes, [])
         self.assertEqual(models['category']._meta.indexes, [])
 
-        col_types = models['coltypes']
+        col_types = models['col_types']
         indexed = set(['f1'])
         unique = set(['f10'])
         for field in col_types._meta.sorted_fields:
@@ -134,11 +138,11 @@ class TestReflection(ModelTestCase):
     def test_table_subset(self):
         models = self.introspector.generate_models(table_names=[
             'category',
-            'coltypes',
+            'col_types',
             'foobarbaz'])
-        self.assertEqual(sorted(models.keys()), ['category', 'coltypes'])
+        self.assertEqual(sorted(models.keys()), ['category', 'col_types'])
 
-    @skip_unless(isinstance(db, SqliteDatabase))
+    @requires_sqlite
     def test_sqlite_fk_re(self):
         user_id_tests = [
             'FOREIGN KEY("user_id") REFERENCES "users"("id")',
@@ -203,7 +207,7 @@ class TestReflection(ModelTestCase):
          indexes) = self.introspector.introspect()
 
         expected = (
-            ('coltypes', (
+            ('col_types', (
                 ('f1', (BigIntegerField, IntegerField), False),
                 # There do not appear to be separate constants for the blob and
                 # text field types in MySQL's drivers. See GH#1034.
@@ -219,7 +223,7 @@ class TestReflection(ModelTestCase):
                 ('f11', AutoField, False),
                 ('f12', TextField, False),
                 ('f13', TimeField, False))),
-            ('relmodel', (
+            ('rel_model', (
                 ('col_types_id', ForeignKeyField, False),
                 ('col_types_nullable_id', ForeignKeyField, True))),
             ('nugget', (
@@ -256,9 +260,9 @@ class TestReflection(ModelTestCase):
          model_names,
          indexes) = self.introspector.introspect()
 
-        self.assertEqual(foreign_keys['coltypes'], [])
+        self.assertEqual(foreign_keys['col_types'], [])
 
-        rel_model = foreign_keys['relmodel']
+        rel_model = foreign_keys['rel_model']
         self.assertEqual(len(rel_model), 2)
 
         fkpk = foreign_keys['fkpk']
@@ -267,7 +271,7 @@ class TestReflection(ModelTestCase):
         fkpk_fk = fkpk[0]
         self.assertEqual(fkpk_fk.table, 'fkpk')
         self.assertEqual(fkpk_fk.column, 'col_types_id')
-        self.assertEqual(fkpk_fk.dest_table, 'coltypes')
+        self.assertEqual(fkpk_fk.dest_table, 'col_types')
         self.assertEqual(fkpk_fk.dest_column, 'f11')
 
         category = foreign_keys['category']
@@ -287,9 +291,9 @@ class TestReflection(ModelTestCase):
          indexes) = self.introspector.introspect()
 
         names = (
-            ('coltypes', 'Coltypes'),
+            ('col_types', 'ColTypes'),
             ('nullable', 'Nullable'),
-            ('relmodel', 'Relmodel'),
+            ('rel_model', 'RelModel'),
             ('fkpk', 'Fkpk'))
         for k, v in names:
             self.assertEqual(model_names[k], v)
@@ -301,12 +305,12 @@ class TestReflection(ModelTestCase):
          model_names,
          indexes) = self.introspector.introspect()
 
-        rel_model = columns['relmodel']
+        rel_model = columns['rel_model']
 
         col_types_id = rel_model['col_types_id']
         self.assertEqual(col_types_id.get_field_parameters(), {
             'column_name': "'col_types_id'",
-            'model': 'Coltypes',
+            'model': 'ColTypes',
             'field': "'f11'",
         })
 
@@ -314,15 +318,15 @@ class TestReflection(ModelTestCase):
         self.assertEqual(col_types_nullable_id.get_field_parameters(), {
             'column_name': "'col_types_nullable_id'",
             'null': True,
-            'backref': "'coltypes_col_types_nullable_set'",
-            'model': 'Coltypes',
+            'backref': "'col_types_col_types_nullable_set'",
+            'model': 'ColTypes',
             'field': "'f11'",
         })
 
         fkpk = columns['fkpk']
         self.assertEqual(fkpk['col_types_id'].get_field_parameters(), {
             'column_name': "'col_types_id'",
-            'model': 'Coltypes',
+            'model': 'ColTypes',
             'primary_key': True,
             'field': "'f11'"})
 
@@ -356,7 +360,7 @@ class TestReflection(ModelTestCase):
          indexes) = self.introspector.introspect()
 
         expected = (
-            ('coltypes', (
+            ('col_types', (
                 ('f1', ('f1 = BigIntegerField(index=True)',
                         'f1 = IntegerField(index=True)')),
                 ('f2', ('f2 = BlobField()', 'f2 = TextField()')),
@@ -376,7 +380,7 @@ class TestReflection(ModelTestCase):
             )),
             ('fkpk', (
                 ('col_types_id', 'col_types = ForeignKeyField('
-                 "column_name='col_types_id', field='f11', model=Coltypes, "
+                 "column_name='col_types_id', field='f11', model=ColTypes, "
                  'primary_key=True)'),
             )),
             ('nugget', (
@@ -384,13 +388,13 @@ class TestReflection(ModelTestCase):
                  "column_name='category_id', field='id', model=Category)"),
                 ('category', 'category = CharField()'),
             )),
-            ('relmodel', (
+            ('rel_model', (
                 ('col_types_id', 'col_types = ForeignKeyField('
-                 "column_name='col_types_id', field='f11', model=Coltypes)"),
+                 "column_name='col_types_id', field='f11', model=ColTypes)"),
                 ('col_types_nullable_id', 'col_types_nullable = '
-                 "ForeignKeyField(backref='coltypes_col_types_nullable_set', "
+                 "ForeignKeyField(backref='col_types_col_types_nullable_set', "
                  "column_name='col_types_nullable_id', field='f11', "
-                 'model=Coltypes, null=True)'),
+                 'model=ColTypes, null=True)'),
             )),
             ('underscores', (
                 ('_id', '_id = AutoField()'),
@@ -411,3 +415,56 @@ class TestReflection(ModelTestCase):
                 actual = columns[table][field_name].get_field()
                 self.assertTrue(actual in fields,
                                 '%s not in %s' % (actual, fields))
+
+
+class EventLog(TestModel):
+    data = CharField(constraints=[SQL('DEFAULT \'\'')])
+    timestamp = DateTimeField(constraints=[SQL('DEFAULT current_timestamp')])
+    flags = IntegerField(constraints=[SQL('DEFAULT 0')])
+
+
+class TestReflectDefaultValues(BaseReflectionTestCase):
+    requires = [EventLog]
+
+    @requires_sqlite
+    def test_default_values(self):
+        models = self.introspector.generate_models()
+        eventlog = models['event_log']
+
+        create_table = (
+            'CREATE TABLE IF NOT EXISTS "event_log" ('
+            '"id" INTEGER NOT NULL PRIMARY KEY, '
+            '"data" VARCHAR(255) NOT NULL DEFAULT \'\', '
+            '"timestamp" DATETIME NOT NULL DEFAULT current_timestamp, '
+            '"flags" INTEGER NOT NULL DEFAULT 0)')
+
+        # Re-create table using the introspected schema.
+        self.assertSQL(eventlog._schema._create_table(), create_table, [])
+        eventlog.drop_table()
+        eventlog.create_table()
+
+        # Verify that the introspected schema has not changed.
+        models = self.introspector.generate_models()
+        eventlog = models['event_log']
+        self.assertSQL(eventlog._schema._create_table(), create_table, [])
+
+
+class TestReflectionDependencies(BaseReflectionTestCase):
+    requires = [User, Tweet]
+
+    def test_generate_dependencies(self):
+        models = self.introspector.generate_models(table_names=['tweet'])
+        self.assertEqual(set(models), set(('users', 'tweet')))
+
+        IUser = models['users']
+        ITweet = models['tweet']
+
+        self.assertEqual(set(ITweet._meta.fields), set((
+            'id', 'user', 'content', 'timestamp')))
+        self.assertEqual(set(IUser._meta.fields), set(('id', 'username')))
+        self.assertTrue(ITweet.user.rel_model is IUser)
+        self.assertTrue(ITweet.user.rel_field is IUser.id)
+
+    def test_ignore_backrefs(self):
+        models = self.introspector.generate_models(table_names=['users'])
+        self.assertEqual(set(models), set(('users',)))

@@ -14,7 +14,7 @@ from .base import ModelTestCase
 from .base import TestModel
 from .base import db_loader
 from .base import mock
-from .base import skip_case_if
+from .base import skip_if
 
 
 db = db_loader('sqlite')
@@ -173,7 +173,6 @@ class TestPwiz(BasePwizTestCase):
             '# Peewee version: %s') % (cmdline, db.database, peewee_version))
 
 
-@skip_case_if(lambda: sys.version_info[:2] < (2, 7))
 class TestPwizOrdered(BasePwizTestCase):
     requires = [User, Note]
 
@@ -193,12 +192,12 @@ class TestPwizInvalidColumns(BasePwizTestCase):
 
         result = output.data.strip()
         expected = textwrap.dedent("""
-            class Oddcolumnnames(BaseModel):
+            class OddColumnNames(BaseModel):
                 s_p_aces = CharField(column_name='s p aces')
                 w_nug_ = CharField(column_name='w/-nug!')
 
                 class Meta:
-                    table_name = 'oddcolumnnames'""").strip()
+                    table_name = 'odd_column_names'""").strip()
 
         actual = result[-len(expected):]
         self.assertEqual(actual, expected)

@@ -40,6 +40,10 @@ make up the ``playhouse``.
 * :ref:`test_utils`
 * :ref:`flask_utils`
 
+Sqlite Extensions
+-----------------
+
+The Sqlite extensions have been moved to :ref:`their own page <sqlite_ext>`.
 
 .. _sqliteq:
 
@@ -608,11 +612,11 @@ Notes:
 
     * [Hopefully] there's no way to tell whether the passphrase is wrong
       or the file is corrupt.
-      In both cases -- *the first time we try to acces the database* -- a
+      In both cases -- *the first time we try to access the database* -- a
       :py:class:`DatabaseError` error is raised,
       with the *exact* message: ``"file is encrypted or is not a database"``.
 
-      As mentioned above, this only happens when you *access* the databse,
+      As mentioned above, this only happens when you *access* the database,
       so if you need to know *right away* whether the passphrase was correct,
       you can trigger this check by calling [e.g.]
       :py:meth:`~Database.get_tables()` (see example below).
@@ -668,8 +672,8 @@ Postgresql Extensions
 The postgresql extensions module provides a number of "postgres-only" functions,
 currently:
 
-* :ref:`hstore support <hstore>`
 * :ref:`json support <pgjson>`, including *jsonb* for Postgres 9.4.
+* :ref:`hstore support <hstore>`
 * :ref:`server-side cursors <server_side_cursors>`
 * :ref:`full-text search <pg_fts>`
 * :py:class:`ArrayField` field type, for storing arrays.
@@ -697,6 +701,81 @@ The code below will assume you are using the following database and base model:
     class BaseExtModel(Model):
         class Meta:
             database = ext_db
+
+.. _pgjson:
+
+JSON Support
+^^^^^^^^^^^^
+
+peewee has basic support for Postgres' native JSON data type, in the form of
+:py:class:`JSONField`. As of version 2.4.7, peewee also supports the Postgres
+9.4 binary json ``jsonb`` type, via :py:class:`BinaryJSONField`.
+
+.. warning::
+  Postgres supports a JSON data type natively as of 9.2 (full support in 9.3).
+  In order to use this functionality you must be using the correct version of
+  Postgres with `psycopg2` version 2.5 or greater.
+
+  To use :py:class:`BinaryJSONField`, which has many performance and querying
+  advantages, you must have Postgres 9.4 or later.
+
+.. note::
+  You must be sure your database is an instance of
+  :py:class:`PostgresqlExtDatabase` in order to use the `JSONField`.
+
+Here is an example of how you might declare a model with a JSON field:
+
+.. code-block:: python
+
+    import json
+    import urllib2
+    from playhouse.postgres_ext import *
+
+    db = PostgresqlExtDatabase('my_database')
+
+    class APIResponse(Model):
+        url = CharField()
+        response = JSONField()
+
+        class Meta:
+            database = db
+
+        @classmethod
+        def request(cls, url):
+            fh = urllib2.urlopen(url)
+            return cls.create(url=url, response=json.loads(fh.read()))
+
+    APIResponse.create_table()
+
+    # Store a JSON response.
+    offense = APIResponse.request('http://crime-api.com/api/offense/')
+    booking = APIResponse.request('http://crime-api.com/api/booking/')
+
+    # Query a JSON data structure using a nested key lookup:
+    offense_responses = APIResponse.select().where(
+        APIResponse.response['meta']['model'] == 'offense')
+
+    # Retrieve a sub-key for each APIResponse. By calling .as_json(), the
+    # data at the sub-key will be returned as Python objects (dicts, lists,
+    # etc) instead of serialized JSON.
+    q = (APIResponse
+         .select(
+           APIResponse.data['booking']['person'].as_json().alias('person'))
+         .where(APIResponse.data['meta']['model'] == 'booking'))
+
+    for result in q:
+        print(result.person['name'], result.person['dob'])
+
+The :py:class:`BinaryJSONField` works the same and supports the same operations
+as the regular :py:class:`JSONField`, but provides several additional
+operations for testing **containment**. Using the binary json field, you can
+test whether your JSON data contains other partial JSON structures
+(:py:meth:`~BinaryJSONField.contains`, :py:meth:`~BinaryJSONField.contains_any`,
+:py:meth:`~BinaryJSONField.contains_all`), or whether it is a subset of a
+larger JSON document (:py:meth:`~BinaryJSONField.contained_by`).
+
+For more examples, see the :py:class:`JSONField` and
+:py:class:`BinaryJSONField` API documents below.
 
 .. _hstore:
 
@@ -865,81 +944,6 @@ Postgres supports durations through the ``INTERVAL`` data-type (`docs <https://w
             def get_long_meetings(cls):
                 return cls.select().where(cls.duration > timedelta(hours=1))
 
-.. _pgjson:
-
-JSON Support
-^^^^^^^^^^^^
-
-peewee has basic support for Postgres' native JSON data type, in the form of
-:py:class:`JSONField`. As of version 2.4.7, peewee also supports the Postgres
-9.4 binary json ``jsonb`` type, via :py:class:`BinaryJSONField`.
-
-.. warning::
-  Postgres supports a JSON data type natively as of 9.2 (full support in 9.3).
-  In order to use this functionality you must be using the correct version of
-  Postgres with `psycopg2` version 2.5 or greater.
-
-  To use :py:class:`BinaryJSONField`, which has many performance and querying
-  advantages, you must have Postgres 9.4 or later.
-
-.. note::
-  You must be sure your database is an instance of
-  :py:class:`PostgresqlExtDatabase` in order to use the `JSONField`.
-
-Here is an example of how you might declare a model with a JSON field:
-
-.. code-block:: python
-
-    import json
-    import urllib2
-    from playhouse.postgres_ext import *
-
-    db = PostgresqlExtDatabase('my_database')
-
-    class APIResponse(Model):
-        url = CharField()
-        response = JSONField()
-
-        class Meta:
-            database = db
-
-        @classmethod
-        def request(cls, url):
-            fh = urllib2.urlopen(url)
-            return cls.create(url=url, response=json.loads(fh.read()))
-
-    APIResponse.create_table()
-
-    # Store a JSON response.
-    offense = APIResponse.request('http://crime-api.com/api/offense/')
-    booking = APIResponse.request('http://crime-api.com/api/booking/')
-
-    # Query a JSON data structure using a nested key lookup:
-    offense_responses = APIResponse.select().where(
-        APIResponse.response['meta']['model'] == 'offense')
-
-    # Retrieve a sub-key for each APIResponse. By calling .as_json(), the
-    # data at the sub-key will be returned as Python objects (dicts, lists,
-    # etc) instead of serialized JSON.
-    q = (APIResponse
-         .select(
-           APIResponse.data['booking']['person'].as_json().alias('person'))
-         .where(APIResponse.data['meta']['model'] == 'booking'))
-
-    for result in q:
-        print(result.person['name'], result.person['dob'])
-
-The :py:class:`BinaryJSONField` works the same and supports the same operations
-as the regular :py:class:`JSONField`, but provides several additional
-operations for testing **containment**. Using the binary json field, you can
-test whether your JSON data contains other partial JSON structures
-(:py:meth:`~BinaryJSONField.contains`, :py:meth:`~BinaryJSONField.contains_any`,
-:py:meth:`~BinaryJSONField.contains_all`), or whether it is a subset of a
-larger JSON document (:py:meth:`~BinaryJSONField.contained_by`).
-
-For more examples, see the :py:class:`JSONField` and
-:py:class:`BinaryJSONField` API documents below.
-
 .. _server_side_cursors:
 
 Server-side cursors
@@ -1090,9 +1094,10 @@ postgres_ext API notes
 
 .. _pgarrays:
 
-.. py:class:: ArrayField([field_class=IntegerField[, dimensions=1[, convert_values=False]]])
+.. py:class:: ArrayField([field_class=IntegerField[, field_kwargs=None[, dimensions=1[, convert_values=False]]]])
 
     :param field_class: a subclass of :py:class:`Field`, e.g. :py:class:`IntegerField`.
+    :param dict field_kwargs: arguments to initialize ``field_class``.
     :param int dimensions: dimensions of array.
     :param bool convert_values: apply ``field_class`` value conversion to array data.
 
@@ -1286,7 +1291,7 @@ postgres_ext API notes
 
         :param keys: One or more keys to search for.
 
-        Query rows for the existince of *any* key.
+        Query rows for the existence of *any* key.
 
 .. py:class:: JSONField(dumps=None, *args, **kwargs)
 
@@ -1757,7 +1762,8 @@ API
 
 .. py:class:: DataSet(url)
 
-    :param str url: A database URL. See :ref:`db_url` for examples.
+    :param url: A database URL or a :py:class:`Database` instance. For
+        details on using a URL, see :ref:`db_url` for examples.
 
     The *DataSet* class provides a high-level API for working with relational
     databases.
@@ -2636,6 +2642,10 @@ This will print a bunch of models to standard output. So you can do this:
     >>> from mymodels import Blog, Entry, Tag, Whatever
     >>> print [blog.name for blog in Blog.select()]
 
+Command-line options
+^^^^^^^^^^^^^^^^^^^^
+
+pwiz accepts the following command-line options:
 
 ======    ========================= ============================================
 Option    Meaning                   Example
@@ -2654,6 +2664,83 @@ The following are valid parameters for the engine:
 * sqlite
 * mysql
 * postgresql
+
+pwiz examples
+^^^^^^^^^^^^^
+
+Examples of introspecting various databases:
+
+.. code-block:: console
+
+    # Introspect a Sqlite database.
+    python -m pwiz -e sqlite path/to/sqlite_database.db
+
+    # Introspect a MySQL database, logging in as root:secret.
+    python -m pwiz -e mysql -u root -P secret mysql_db_name
+
+    # Introspect a Postgresql database on a remote server.
+    python -m pwiz -e postgres -u postgres -H 10.1.0.3 pg_db_name
+
+Full example:
+
+.. code-block:: console
+
+    $ sqlite3 example.db << EOM
+    CREATE TABLE "user" ("id" INTEGER NOT NULL PRIMARY KEY, "username" TEXT NOT NULL);
+    CREATE TABLE "tweet" (
+        "id" INTEGER NOT NULL PRIMARY KEY,
+        "content" TEXT NOT NULL,
+        "timestamp" DATETIME NOT NULL,
+        "user_id" INTEGER NOT NULL,
+        FOREIGN KEY ("user_id") REFERENCES "user" ("id"));
+    CREATE UNIQUE INDEX "user_username" ON "user" ("username");
+    EOM
+
+    $ python -m pwiz -e sqlite example.db
+
+Produces the following output:
+
+.. code-block:: python
+
+    from peewee import *
+
+    database = SqliteDatabase('example.db', **{})
+
+    class UnknownField(object):
+        def __init__(self, *_, **__): pass
+
+    class BaseModel(Model):
+        class Meta:
+            database = database
+
+    class User(BaseModel):
+        username = TextField(unique=True)
+
+        class Meta:
+            table_name = 'user'
+
+    class Tweet(BaseModel):
+        content = TextField()
+        timestamp = DateTimeField()
+        user = ForeignKeyField(column_name='user_id', field='id', model=User)
+
+        class Meta:
+            table_name = 'tweet'
+
+Observations:
+
+* The foreign-key ``Tweet.user_id`` is detected and mapped correctly.
+* The ``User.username`` UNIQUE constraint is detected.
+* Each model explicitly declares its table name, even in cases where it is not
+  necessary (as Peewee would automatically translate the class name into the
+  appropriate table name).
+* All the parameters of the :py:class:`ForeignKeyField` are explicitly
+  declared, even though they follow the conventions Peewee uses by default.
+
+.. note::
+    The ``UnknownField`` is a placeholder that is used in the event your schema
+    contains a column declaration that Peewee doesn't know how to map to a
+    field class.
 
 .. _migrate:
 
@@ -2712,11 +2799,11 @@ Use :py:func:`migrate` to execute one or more operations:
 .. warning::
     Migrations are not run inside a transaction. If you wish the migration to
     run in a transaction you will need to wrap the call to `migrate` in a
-    transaction block, e.g.
+    :py:meth:`~Database.atomic` context-manager, e.g.
 
     .. code-block:: python
 
-        with my_db.transaction():
+        with my_db.atomic():
             migrate(...)
 
 Supported Operations
@@ -2868,11 +2955,12 @@ Migrations API
         :param str old_name: Current name of the table.
         :param str new_name: New name for the table.
 
-    .. py:method:: add_index(table, columns[, unique=False])
+    .. py:method:: add_index(table, columns[, unique=False[, using=None]])
 
         :param str table: Name of table on which to create the index.
         :param list columns: List of columns which should be indexed.
         :param bool unique: Whether the new index should specify a unique constraint.
+        :param str using: Index type (where supported), e.g. GiST or GIN.
 
     .. py:method:: drop_index(table, index_name)
 

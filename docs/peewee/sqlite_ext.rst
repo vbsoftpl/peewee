@@ -55,12 +55,24 @@ APIs
     :param bool rank_functions: Make search result ranking functions available.
     :param bool hash_functions: Make hashing functions available (md5, sha1, etc).
     :param bool regexp_function: Make the REGEXP function available.
-    :param bool bloomfilter: Make the :ref:`sqlite-bloomfilter` available.
+    :param bool bloomfilter: Make the :ref:`bloom filter <sqlite-extras>` available.
 
     Extends :py:class:`SqliteDatabase` and inherits methods for declaring
     user-defined functions, pragmas, etc.
 
-.. py:class:: CSqliteExtDatabase(database[, pragmas=None[, timeout=5[, c_extensions=None[, rank_functions=True[, hash_functions=False[, regexp_function=False[, bloomfilter=False]]]]]]])
+.. py:class:: CSqliteExtDatabase(database[, pragmas=None[, timeout=5[, c_extensions=None[, rank_functions=True[, hash_functions=False[, regexp_function=False[, bloomfilter=False[, replace_busy_handler=False]]]]]]]])
+
+    :param list pragmas: A list of 2-tuples containing pragma key and value to
+        set every time a connection is opened.
+    :param timeout: Set the busy-timeout on the SQLite driver (in seconds).
+    :param bool c_extensions: Declare that C extension speedups must/must-not
+        be used. If set to ``True`` and the extension module is not available,
+        will raise an :py:class:`ImproperlyConfigured` exception.
+    :param bool rank_functions: Make search result ranking functions available.
+    :param bool hash_functions: Make hashing functions available (md5, sha1, etc).
+    :param bool regexp_function: Make the REGEXP function available.
+    :param bool bloomfilter: Make the :ref:`bloom filter <sqlite-extras>` available.
+    :param bool replace_busy_handler: Use a smarter busy-handler implementation.
 
     Extends :py:class:`SqliteExtDatabase` and requires that the
     ``playhouse._sqlite_ext`` extension module be available.
@@ -146,10 +158,17 @@ APIs
             >>> db.autocommit
             True
 
-    .. py:method:: backup(destination)
+    .. py:method:: backup(destination[, pages=None, name=None, progress=None])
 
         :param SqliteDatabase destination: Database object to serve as
             destination for the backup.
+        :param int pages: Number of pages per iteration. Default value of -1
+            indicates all pages should be backed-up in a single step.
+        :param str name: Name of source database (may differ if you used ATTACH
+            DATABASE to load multiple databases). Defaults to "main".
+        :param progress: Progress callback, called with three parameters: the
+            number of pages remaining, the total page count, and whether the
+            backup is complete.
 
         Example:
 
@@ -161,9 +180,16 @@ APIs
             # Backup the contents of master to replica.
             master.backup(replica)
 
-    .. py:method:: backup_to_file(filename)
+    .. py:method:: backup_to_file(filename[, pages, name, progress])
 
         :param filename: Filename to store the database backup.
+        :param int pages: Number of pages per iteration. Default value of -1
+            indicates all pages should be backed-up in a single step.
+        :param str name: Name of source database (may differ if you used ATTACH
+            DATABASE to load multiple databases). Defaults to "main".
+        :param progress: Progress callback, called with three parameters: the
+            number of pages remaining, the total page count, and whether the
+            backup is complete.
 
         Backup the current database to a file. The backed-up data is not a
         database dump, but an actual SQLite database file.
@@ -268,207 +294,199 @@ APIs
     number of helper functions for working with JSON data. These APIs are
     exposed as methods of a special field-type, :py:class:`JSONField`.
 
-    Most functions that operate on JSON fields take a ``path`` argument. The
-    JSON extension documents specify that the path should begin with ``$``
-    followed by zero or more instances of ``.objectlabel`` or ``[arrayindex]``.
-    Peewee simplifies this by allowing you to omit the ``$`` character and just
-    specify the path you need or ``None`` for an empty path:
+    To access or modify specific object keys or array indexes in a JSON
+    structure, you can treat the :py:class:`JSONField` as if it were a
+    dictionary/list.
 
-    * ``path=''`` --> ``'$'``
-    * ``path='tags'`` --> ``'$.tags'``
-    * ``path='[0][1].bar'`` --> ``'$[0][1].bar'``
-    * ``path='metadata[0]'`` --> ``'$.metadata[0]'``
-    * ``path='user.data.email'`` --> ``'$.user.data.email'``
+    Let's look at some examples of using the SQLite json1 extension with
+    Peewee. Here we'll prepare a database and a simple model for testing the
+    `json1 extension <http://sqlite.org/json1.html>`_:
 
-    Rather than specifying the paths as a string, you can also use the
-    :py:class:`JSONPath` helper (exposed as the ``J`` object):
+    .. code-block:: pycon
 
-    * ``J`` --> ``'$'``
-    * ``J.tags`` --> ``'$.tags'``
-    * ``J[0][1].bar`` --> ``'$[0][1].bar'``
-    * ``J.metadata[0]`` --> ``'$.metadata[0]'``
-    * ``J.user.data.email`` --> ``'$.user.data.email'``
-    * ``J['1337']`` --> ``'$.1337'`` (key "1337" rather an array index)
+        >>> from playhouse.sqlite_ext import *
+        >>> db = SqliteExtDatabase(':memory:')
+        >>> class KV(Model):
+        ...     key = TextField()
+        ...     value = JSONField()
+        ...     class Meta:
+        ...         database = db
+        ...
 
-    .. py:method:: length(*paths)
+        >>> KV.create_table()
 
-        :param JSONPath paths: Zero or more JSON paths.
+    Storing data works as you might expect. There's no need to serialize
+    dictionaries or lists as JSON, as this is done automatically by Peewee:
 
-        Returns the length of the JSON object stored, either in the column, or
-        at one or more paths within the column data.
+    .. code-block:: pycon
+
+        >>> KV.create(key='a', value={'k1': 'v1'})
+        <KV: 1>
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1'}
+
+    We can access specific parts of the JSON data using dictionary lookups:
+
+    .. code-block:: pycon
+
+        >>> KV.get(KV.value['k1'] == 'v1').key
+        'a'
+
+    It's possible to update a JSON value in-place using the :py:meth:`~JSONField.update`
+    method. Note that "k1=v1" is preserved:
+
+    .. code-block:: pycon
+
+        >>> KV.update(value=KV.value.update({'k2': 'v2', 'k3': 'v3'})).execute()
+        1
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1', 'k2': 'v2', 'k3': 'v3'}
+
+    We can also update existing data atomically, or remove keys by setting
+    their value to ``None``. In the following example, we'll update the value
+    of "k1" and remove "k3" ("k2" will not be modified):
+
+    .. code-block:: pycon
+
+        >>> KV.update(value=KV.value.update({'k1': 'v1-x', 'k3': None})).execute()
+        1
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1-x', 'k2': 'v2'}
+
+    We can also set individual parts of the JSON data using the :py:meth:`~JSONField.set` method:
+
+    .. code-block:: pycon
+
+        >>> KV.update(value=KV.value['k1'].set('v1')).execute()
+        1
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1', 'k2': 'v2'}
+
+    The :py:meth:`~JSONField.set` method can also be used with objects, in
+    addition to scalar values:
+
+    .. code-block:: pycon
+
+        >>> KV.update(value=KV.value['k2'].set({'x2': 'y2'})).execute()
+        1
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1', 'k2': {'x2': 'y2'}}
+
+    Individual parts of the JSON data can be removed atomically as well, using
+    :py:meth:`~JSONField.remove`:
+
+    .. code-block:: pycon
+
+        >>> KV.update(value=KV.value['k2'].remove()).execute()
+        1
+        >>> KV.get(KV.key == 'a').value
+        {'k1': 'v1'}
+
+    We can also get the type of value stored at a specific location in the JSON
+    data using the :py:meth:`~JSONField.json_type` method:
+
+    .. code-block:: pycon
+
+        >>> KV.select(KV.value.json_type(), KV.value['k1'].json_type()).tuples()[:]
+        [('object', 'text')]
+
+    Let's add a nested value and then see how to iterate through it's contents
+    recursively using the :py:meth:`~JSONField.tree` method:
+
+    .. code-block:: pycon
+
+        >>> KV.create(key='b', value={'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]})
+        <KV: 2>
+        >>> tree = KV.value.tree().alias('tree')
+        >>> query = KV.select(KV.key, tree.c.fullkey, tree.c.value).from_(KV, tree)
+        >>> query.tuples()[:]
+        [('a', '$', {'k1': 'v1'}),
+         ('a', '$.k1', 'v1'),
+         ('b', '$', {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]}),
+         ('b', '$.x2', [1, 2]),
+         ('b', '$.x2[0]', 1),
+         ('b', '$.x2[1]', 2),
+         ('b', '$.x1', {'y1': 'z1', 'y2': 'z2'}),
+         ('b', '$.x1.y1', 'z1'),
+         ('b', '$.x1.y2', 'z2')]
+
+    The :py:meth:`~JSONField.tree` and :py:meth:`~JSONField.children` methods
+    are powerful. For more information on how to utilize them, see the
+    `json1 extension documentation <http://sqlite.org/json1.html#jtree>`_.
+
+    Also note, that :py:class:`JSONField` lookups can be chained:
+
+    .. code-block:: pycon
+
+        >>> query = KV.select().where(KV.value['x1']['y1'] == 'z1')
+        >>> for obj in query:
+        ...     print(obj.key, obj.value)
+        ...
+
+        'b', {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': [1, 2]}
+
+    For more information, refer to the `sqlite json1 documentation <http://sqlite.org/json1.html>`_.
+
+    .. py:method:: __getitem__(item)
+
+        :param item: Access a specific key or array index in the JSON data.
+        :return: a special object exposing access to the JSON data.
+        :rtype: JSONPath
+
+        Access a specific key or array index in the JSON data. Returns a
+        :py:class:`JSONPath` object, which exposes convenient methods for
+        reading or modifying a particular part of a JSON object.
 
         Example:
 
         .. code-block:: python
 
-            # Get APIResponses annotated with the count of tags where the
-            # category key has a value of "posts".
-            query = (APIResponse
-                     .select(
-                       APIResponse,
-                       APIResponse.json_data.length(J.metadata.tags).alias('tag_count'))
-                     .where(APIResponse.json_data['category'] == 'posts'))
+            # If metadata contains {"tags": ["list", "of", "tags"]}, we can
+            # extract the first tag in this way:
+            Post.select(Post, Post.metadata['tags'][0].alias('first_tag'))
 
-    .. py:method:: extract(*paths)
+        For more examples see the :py:class:`JSONPath` API documentation.
 
-        :param JSONPath paths: One or more JSON paths.
+    .. py:method:: set(value[, as_json=None])
 
-        Extracts the JSON objects at the given path(s) from the column data.
-        For example if you have a complex JSON object and only need to work
-        with the value of a specific key, you can use the extract method,
-        specifying the path to the key, to return only the data you need.
+        :param value: a scalar value, list, or dictionary.
+        :param bool as_json: force the value to be treated as JSON, in which
+            case it will be serialized as JSON in Python beforehand. By
+            default, lists and dictionaries are treated as JSON to be
+            serialized, while strings and integers are passed as-is.
 
-        Instead of using :py:meth:`~JSONField.extract`, you can also use square
-        brackets to express the same thing.
+        Set the value stored in a :py:class:`JSONField`.
 
-        Example:
-
-        .. code-block:: python
-
-            # Query for the "title" and "category" values stored in the
-            # json_data column for APIResponses whose category is "posts".
-            query = (APIResponse
-                     .select(APIResponse.json_data[J.title].alias('title'),
-                             APIResponse.json_data[J.metadata.tags].alias('tags'))
-                     .where(APIResponse.json_data[J.category] == 'posts'))
-
-            for response in query:
-                print(response.title, response.tags)
-
-            # Example (note that JSON lists are returned as Python lists):
-            # ('Post 1', ['foo', 'bar'])
-            # ('Post 2', ['baz', 'nug'])
-            # ('Post 3', [])
-
-    .. py:method:: insert(*pairs, **data)
-
-        :param pairs: A flat list consisting of *key*, *value* pairs. E.g.,
-            k1, v1, k2, v2, k3, v3. The key may be a simple string or a
-            :py:class:`JSONPath` instance.
-        :param data: keyword arguments mapping paths to values to insert.
-
-        Insert the values at the given keys (or paths) in the column data. If
-        the key/path specified already has a value, it will **not** be
-        overwritten.
-
-        Example of adding a new key/value to a sub-key:
-
-        .. code-block:: python
-
-            # Existing data in column is preserved and "new_key": "new value"
-            # is stored in the "metadata" dictionary. If "new_key" already
-            # existed, however, the existing data would not be overwritten.
-            nrows = (APIResponse
-                     .update(json_data=APIResponse.json_data.insert(
-                        'metadata.new_key', 'new value'))
-                     .where(APIResponse.json_data[J.category] == 'posts')
-                     .execute())
-
-    .. py:method:: replace(*pairs, **data)
-
-        :param pairs: A flat list consisting of *key*, *value* pairs. E.g.,
-            k1, v1, k2, v2, k3, v3. The key may be a simple string or a
-            :py:class:`JSONPath` instance.
-        :param data: keyword arguments mapping paths to values to replace.
-
-        Replace the values at the given keys (or paths) in the column data. If
-        the key/path specified does not exist, a new key will not be created.
-        Data must exist first in order to be replaced.
-
-        Example of replacing the value of an existing key:
-
-        .. code-block:: python
-
-            # Rename the "posts" category to "notes".
-            nrows = (APIResponse
-                     .update(json_data=APIResponse.json_data.replace(
-                        'category', 'notes'))
-                     .where(APIResponse.json_data[J.category] == 'posts')
-                     .execute())
-
-    .. py:method:: set(*pairs, **data)
-
-        :param pairs: A flat list consisting of *key*, *value* pairs. E.g.,
-            k1, v1, k2, v2, k3, v3. The key may be a simple string or a
-            :py:class:`JSONPath` instance.
-        :param data: keyword arguments mapping paths to values to set.
-
-        Set the values at the given keys (or paths) in the column data. The
-        values will be created/updated regardless of whether the key exists
-        already.
-
-        Example of setting two new key/value pairs:
-
-        .. code-block:: python
-
-            nrows = (APIResponse
-                     .update(json_data=APIResponse.json_data.set(
-                        'metadata.key1', 'value1',
-                        'metadata.key2', [1, 2, 3]))
-                     .execute())
-
-            # Retrieve an arbitrary row from the db to inspect it's metadata.
-            obj = APIResponse.get()
-            print(obj.json_data['metadata'])  # key1 and key2 are present.
-            # {'key2': [1, 2, 3], 'key1': 'value1', 'tags': ['foo', 'bar']}
-
-    .. py:method:: remove(*paths)
-
-        :param JSONPath paths: One or more JSON paths.
-
-        Remove the data at the given paths from the column data.
-
-        Example of removing two paths:
-
-        .. code-block:: python
-
-            # Update the data, removing "key1" and "key2" from the "metadata"
-            # object.
-            (APIResponse
-             .update(json_data=APIResponse.json_data.remove(
-                'metadata.key1',
-                'metadata.key2'))
-             .execute())
-
-             # Equivalent, using J:
-            (APIResponse
-             .update(json_data=APIResponse.json_data.remove(
-                J.metadata.key1,
-                J.metadata.key2))
-             .execute())
+        Uses the `json_set() <http://sqlite.org/json1.html#jset>`_ function
+        from the json1 extension.
 
     .. py:method:: update(data)
 
-        :param data: A JSON value.
+        :param data: a scalar value, list or dictionary to merge with the data
+            currently stored in a :py:class:`JSONField`. To remove a particular
+            key, set that key to ``None`` in the updated data.
 
-        Updates the column data in-place, *merging* the new data with the data
-        already present in the column. This is different than
-        :py:meth:`~JSONField.set`, as sub-dictionaries will be merged with
-        other sub-dictionaries, recursively.
+        Merge new data into the JSON value using the RFC-7396 MergePatch
+        algorithm to apply a patch (``data`` parameter) against the column
+        data. MergePatch can add, modify, or delete elements of a JSON object,
+        which means :py:meth:`~JSONField.update` is a generalized replacement
+        for both :py:meth:`~JSONField.set` and :py:meth:`~JSONField.remove`.
+        MergePatch treats JSON array objects as atomic, so ``update()`` cannot
+        append to an array, nor modify individual elements of an array.
 
-        .. code-block:: pycon
+        For more information as well as examples, see the SQLite `json_patch() <http://sqlite.org/json1.html#jpatch>`_
+        function documentation.
 
-            >>> data = {'k1': {'foo': 1, 'bar': 2}, 'k2': {'baz': 3}}
-            >>> resp = APIResponse.create(json_data=data)
-            >>> resp
-            <__main__.APIResponse at 0x7f0b28115cc0>
+    .. py:method:: remove()
 
-            >>> patch = {'k1': {'foo': 1337, 'nug': 0}, 'k3': [1, 2]}
-            >>> (APIResponse
-            ...  .update(json_data=APIResponse.json_data.update(patch))
-            ...  .where(APIResponse.id == resp.id)
-            ...  .execute())
-            1
+        Remove the data stored in the :py:class:`JSONField`.
 
-            >>> APIResponse.get(APIResponse.id == resp.id).json_data
-            {'k1': {'bar': 2, 'foo': 1337, 'nug': 0}, 'k2': {'baz': 3}, 'k3': [1, 2]}
+        Uses the `json_type <https://www.sqlite.org/json1.html#jrm>`_ function
+        from the json1 extension.
 
-    .. py:method:: json_type([path=None])
+    .. py:method:: json_type()
 
-        :param JSONPath path: A JSON path (optional).
-
-        Return a string identifying the type of value stored in the column (or
-        at the given path).
+        Return a string identifying the type of value stored in the column.
 
         The type returned will be one of:
 
@@ -482,7 +500,17 @@ APIs
         * null  <-- the string "null" means an actual NULL value
         * NULL  <-- an actual NULL value means the path was not found
 
-    .. py:method:: children([path=None])
+        Uses the `json_type <https://www.sqlite.org/json1.html#jtype>`_
+        function from the json1 extension.
+
+    .. py:method:: length()
+
+        Return the length of the array stored in the column.
+
+        Uses the `json_array_length <https://www.sqlite.org/json1.html#jarraylen>`_
+        function from the json1 extension.
+
+    .. py:method:: children()
 
         The ``children`` function corresponds to ``json_each``, a table-valued
         function that walks the JSON value provided and returns the immediate
@@ -503,9 +531,10 @@ APIs
 
         For examples, see `my blog post on JSON1 <http://charlesleifer.com/blog/using-the-sqlite-json1-and-fts5-extensions-with-python/>`_.
 
-        `SQLite documentation on json_each <https://www.sqlite.org/json1.html#jeach>`_.
+        Uses the `json_each <https://www.sqlite.org/json1.html#jeach>`_
+        function from the json1 extension.
 
-    .. py:method:: tree([path=None])
+    .. py:method:: tree()
 
         The ``tree`` function corresponds to ``json_tree``, a table-valued
         function that recursively walks the JSON value provided and returns
@@ -526,11 +555,14 @@ APIs
 
         For examples, see `my blog post on JSON1 <http://charlesleifer.com/blog/using-the-sqlite-json1-and-fts5-extensions-with-python/>`_.
 
-        `SQLite documentation on json_tree <https://www.sqlite.org/json1.html#jeach>`_.
+        Uses the `json_tree <https://www.sqlite.org/json1.html#jtree>`_
+        function from the json1 extension.
 
-.. py:class:: JSONPath([path=None])
 
-    :param list path: Components comprising the JSON path.
+.. py:class:: JSONPath(field[, path=None])
+
+    :param JSONField field: the field object we intend to access.
+    :param tuple path: Components comprising the JSON path.
 
     A convenient, Pythonic way of representing JSON paths for use with
     :py:class:`JSONField`.
@@ -538,33 +570,101 @@ APIs
     The ``JSONPath`` object implements ``__getitem__``, accumulating path
     components, which it can turn into the corresponding json-path expression.
 
-    .. attention::
-        Rather than instantiating this class directly, use the ``J`` instance
-        to create JSON paths:
+    .. py:method:: __getitem__(item)
+
+        :param item: Access a sub-key key or array index.
+        :return: a :py:class:`JSONPath` representing the new path.
+
+        Access a sub-key or array index in the JSON data. Returns a
+        :py:class:`JSONPath` object, which exposes convenient methods for
+        reading or modifying a particular part of a JSON object.
+
+        Example:
 
         .. code-block:: python
 
-            from playhouse.sqlite_ext import J
+            # If metadata contains {"tags": ["list", "of", "tags"]}, we can
+            # extract the first tag in this way:
+            first_tag = Post.metadata['tags'][0]
+            query = (Post
+                     .select(Post, first_tag.alias('first_tag'))
+                     .order_by(first_tag))
 
-            class APIResponse(Model):
-                data = JSONField()
+    .. py:method:: set(value[, as_json=None])
 
-            # Select the "title" and "metadata"."tags" paths from the data
-            # field, filtering on "category" is 'post'.
-            query = (APIResponse
-                     .select(APIResponse.data[J.title].alias('title'),
-                             APIResponse.data[J.metadata.tags].alias('tags'))
-                     .where(APIResponse.data[J.category] == 'post'))
+        :param value: a scalar value, list, or dictionary.
+        :param bool as_json: force the value to be treated as JSON, in which
+            case it will be serialized as JSON in Python beforehand. By
+            default, lists and dictionaries are treated as JSON to be
+            serialized, while strings and integers are passed as-is.
 
-    For example (using the ``J`` mnemonic, as described above):
+        Set the value at the given location in the JSON data.
 
-    * J -> $  - root element lookup.
-    * J.category -> $.category
-    * J.metadata.tags[0] -> $.metadata.tags[0]
-    * J[0] -> $[0]  - Lookup the first element in an array.
-    * J['0'] -> $.0  - Here we would look up the key "0" rather than the first
-      element in an array.
-    * J['foo'] (same as J.foo) -> $.foo
+        Uses the `json_set() <http://sqlite.org/json1.html#jset>`_ function
+        from the json1 extension.
+
+    .. py:method:: update(data)
+
+        :param data: a scalar value, list or dictionary to merge with the data
+            at the given location in the JSON data. To remove a particular key,
+            set that key to ``None`` in the updated data.
+
+        Merge new data into the JSON value using the RFC-7396 MergePatch
+        algorithm to apply a patch (``data`` parameter) against the column
+        data. MergePatch can add, modify, or delete elements of a JSON object,
+        which means :py:meth:`~JSONPath.update` is a generalized replacement
+        for both :py:meth:`~JSONPath.set` and :py:meth:`~JSONPath.remove`.
+        MergePatch treats JSON array objects as atomic, so ``update()`` cannot
+        append to an array, nor modify individual elements of an array.
+
+        For more information as well as examples, see the SQLite `json_patch() <http://sqlite.org/json1.html#jpatch>`_
+        function documentation.
+
+    .. py:method:: remove()
+
+        Remove the data stored in at the given location in the JSON data.
+
+        Uses the `json_type <https://www.sqlite.org/json1.html#jrm>`_ function
+        from the json1 extension.
+
+    .. py:method:: json_type()
+
+        Return a string identifying the type of value stored at the given
+        location in the JSON data.
+
+        The type returned will be one of:
+
+        * object
+        * array
+        * integer
+        * real
+        * true
+        * false
+        * text
+        * null  <-- the string "null" means an actual NULL value
+        * NULL  <-- an actual NULL value means the path was not found
+
+        Uses the `json_type <https://www.sqlite.org/json1.html#jtype>`_
+        function from the json1 extension.
+
+    .. py:method:: length()
+
+        Return the length of the array stored at the given location in the JSON
+        data.
+
+        Uses the `json_array_length <https://www.sqlite.org/json1.html#jarraylen>`_
+        function from the json1 extension.
+
+    .. py:method:: children()
+
+        Table-valued function that exposes the direct descendants of a JSON
+        object at the given location. See also :py:meth:`JSONField.children`.
+
+    .. py:method:: tree()
+
+        Table-valued function that exposes all descendants, recursively, of a
+        JSON object at the given location. See also :py:meth:`JSONField.tree`.
+
 
 .. py:class:: SearchField([unindexed=False[, column_name=None]])
 
@@ -599,6 +699,14 @@ APIs
     * ``options`` - a dictionary of settings to apply in virtual table
           constructor.
     * ``primary_key`` - defaults to ``False``, indicating no primary key.
+
+    These all are combined in the following way:
+
+    .. code-block:: sql
+
+        CREATE VIRTUAL TABLE <table_name>
+        USING <extension_module>
+        ([prefix_arguments, ...] fields, ... [arguments, ...], [options...])
 
 .. _sqlite-fts:
 
@@ -690,8 +798,8 @@ APIs
                     .order_by(DocumentIndex.bm25()))
 
     .. warning::
-        All SQL queries on ``FTSModel`` classes will be slow **except**
-        full-text searches and ``rowid`` lookups.
+        All SQL queries on ``FTSModel`` classes will be full-table scans
+        **except** full-text searches and ``rowid`` lookups.
 
     If the primary source of the content you are indexing exists in a separate
     table, you can save some disk space by instructing SQLite to not store an
@@ -1125,6 +1233,12 @@ APIs
         *Optional* - specify the name for the table function. If not provided,
         name will be taken from the class name.
 
+    .. py:attribute:: print_tracebacks = True
+
+        Print a full traceback for any errors that occur in the
+        table-function's callback methods. When set to False, only the generic
+        OperationalError will be visible.
+
     .. py:method:: initialize(**parameter_values)
 
         :param parameter_values: Parameters the function was called with.
@@ -1189,10 +1303,10 @@ APIs
     `transitive closure <http://www.sqlite.org/cgi/src/artifact/636024302cde41b2bf0c542f81c40c624cfb7012>`_
     table. Closure tables are :py:class:`VirtualModel` subclasses that work
     with the transitive closure SQLite extension. These special tables are
-    designed to make it easy to efficiently query heirarchical data. The SQLite
+    designed to make it easy to efficiently query hierarchical data. The SQLite
     extension manages an AVL tree behind-the-scenes, transparently updating the
     tree when your table changes and making it easy to perform common queries
-    on heirarchical data.
+    on hierarchical data.
 
     To use the closure table extension in your project, you need:
 
@@ -1430,7 +1544,7 @@ APIs
         ts = get_timestamp()
         EventLog[ts] = ('pageview', 'search', '/blog/some-post/')
 
-        # Retreive row from event log.
+        # Retrieve row from event log.
         log = EventLog[ts]
         print(log.action, log.sender, log.target)
         # Prints ("pageview", "search", "/blog/some-post/")

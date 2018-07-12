@@ -19,7 +19,7 @@ from .base import db
 from .base import db_loader
 from .base import get_in_memory_db
 from .base import requires_models
-from .base import skip_case_unless
+from .base import requires_postgresql
 from .base_models import Category
 from .base_models import Tweet
 from .base_models import User
@@ -38,6 +38,20 @@ class TestDatabase(DatabaseTestCase):
         self.assertEqual(self.database.foreign_keys, 1)
         self.database.foreign_keys = 'off'
         self.assertEqual(self.database.foreign_keys, 0)
+
+    def test_timeout_semantics(self):
+        self.assertEqual(self.database.timeout, 5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 5000)
+
+        self.database.timeout = 2.5
+        self.assertEqual(self.database.timeout, 2.5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 2500)
+
+        self.database.close()
+        self.database.connect()
+
+        self.assertEqual(self.database.timeout, 2.5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 2500)
 
     def test_pragmas_deferred(self):
         pragmas = (('journal_mode', 'wal'),)
@@ -63,8 +77,26 @@ class TestDatabase(DatabaseTestCase):
         db.init(':memory:', pragmas=(('cache_size', -8000),))
         self.assertEqual(db._pragmas, (('cache_size', -8000),))
 
+    def test_pragmas_as_dict(self):
+        pragmas = {'journal_mode': 'wal'}
+        pragma_list = [('journal_mode', 'wal')]
+
+        db = SqliteDatabase(':memory:', pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragma_list)
+
+        # Test deferred databases correctly handle pragma dicts.
+        db = SqliteDatabase(None, pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragma_list)
+
+        db.init(':memory:')
+        self.assertEqual(db._pragmas, pragma_list)
+
+        db.init(':memory:', pragmas={})
+        self.assertEqual(db._pragmas, [])
+
     def test_pragmas_permanent(self):
         db = SqliteDatabase(':memory:')
+        db.execute_sql('pragma foreign_keys=0')
         self.assertEqual(db.foreign_keys, 0)
 
         db.pragma('foreign_keys', 1, True)
@@ -93,7 +125,7 @@ class TestDatabase(DatabaseTestCase):
         self.assertEqual(state.operations['ILIKE'], 'ILIKE')
 
         self.assertEqual(state.param, '$')
-        self.assertEqual(state.quote, '"')
+        self.assertEqual(state.quote, '""')
 
         test_db2 = TestDatabase(None, field_types={'BIGINT': 'XXX_BIGINT',
                                                    'INT': 'XXX_INT'})
@@ -219,22 +251,23 @@ class TestDatabase(DatabaseTestCase):
 
 
 class TestThreadSafety(ModelTestCase):
+    nthreads = 4
+    nrows = 10
     requires = [User]
 
     def test_multiple_writers(self):
         def create_users(idx):
-            n = 10
-            for i in range(idx * n, (idx + 1) * n):
+            for i in range(idx * self.nrows, (idx + 1) * self.nrows):
                 User.create(username='u%d' % i)
 
         threads = []
-        for i in range(4):
+        for i in range(self.nthreads):
             threads.append(threading.Thread(target=create_users, args=(i,)))
 
         for t in threads: t.start()
         for t in threads: t.join()
 
-        self.assertEqual(User.select().count(), 40)
+        self.assertEqual(User.select().count(), self.nrows * self.nthreads)
 
     def test_multiple_readers(self):
         data = Queue()
@@ -243,13 +276,13 @@ class TestThreadSafety(ModelTestCase):
                 data.put(User.select().count())
 
         threads = []
-        for i in range(4):
+        for i in range(self.nthreads):
             threads.append(threading.Thread(target=read_user_count,
-                                            args=(10,)))
+                                            args=(self.nrows,)))
 
         for t in threads: t.start()
         for t in threads: t.join()
-        self.assertEqual(data.qsize(), 40)
+        self.assertEqual(data.qsize(), self.nrows * self.nthreads)
 
 
 class TestDeferredDatabase(BaseTestCase):
@@ -287,7 +320,7 @@ class CatToy(TestModel):
         schema = 'huey'
 
 
-@skip_case_unless(isinstance(db, PostgresqlDatabase))
+@requires_postgresql
 class TestSchemaNamespace(ModelTestCase):
     requires = [CatToy]
 
@@ -362,8 +395,8 @@ class TestIntrospection(ModelTestCase):
     requires = [Category, User, UniqueModel, IndexedModel]
 
     def test_table_exists(self):
-        self.assertTrue(self.database.table_exists(User._meta.table))
-        self.assertFalse(self.database.table_exists(Table('nuggies')))
+        self.assertTrue(self.database.table_exists(User._meta.table_name))
+        self.assertFalse(self.database.table_exists('nuggies'))
 
     def test_get_tables(self):
         tables = self.database.get_tables()
@@ -375,32 +408,32 @@ class TestIntrospection(ModelTestCase):
         self.assertFalse(UniqueModel._meta.table_name in tables)
 
     def test_get_indexes(self):
-        indexes = self.database.get_indexes('uniquemodel')
+        indexes = self.database.get_indexes('unique_model')
         data = [(index.name, index.columns, index.unique, index.table)
                 for index in indexes
-                if index.name not in ('uniquemodel_pkey', 'PRIMARY')]
+                if index.name not in ('unique_model_pkey', 'PRIMARY')]
         self.assertEqual(data, [
-            ('uniquemodel_name', ['name'], True, 'uniquemodel')])
+            ('unique_model_name', ['name'], True, 'unique_model')])
 
-        indexes = self.database.get_indexes('indexedmodel')
+        indexes = self.database.get_indexes('indexed_model')
         data = [(index.name, index.columns, index.unique, index.table)
                 for index in indexes
-                if index.name not in ('indexedmodel_pkey', 'PRIMARY')]
+                if index.name not in ('indexed_model_pkey', 'PRIMARY')]
         self.assertEqual(sorted(data), [
-            ('indexedmodel_first_last', ['first', 'last'], False,
-             'indexedmodel'),
-            ('indexedmodel_first_last_dob', ['first', 'last', 'dob'], True,
-             'indexedmodel')])
+            ('indexed_model_first_last', ['first', 'last'], False,
+             'indexed_model'),
+            ('indexed_model_first_last_dob', ['first', 'last', 'dob'], True,
+             'indexed_model')])
 
     def test_get_columns(self):
-        columns = self.database.get_columns('indexedmodel')
+        columns = self.database.get_columns('indexed_model')
         data = [(c.name, c.null, c.primary_key, c.table)
                 for c in columns]
         self.assertEqual(data, [
-            ('id', False, True, 'indexedmodel'),
-            ('first', False, False, 'indexedmodel'),
-            ('last', False, False, 'indexedmodel'),
-            ('dob', False, False, 'indexedmodel')])
+            ('id', False, True, 'indexed_model'),
+            ('first', False, False, 'indexed_model'),
+            ('last', False, False, 'indexed_model'),
+            ('dob', False, False, 'indexed_model')])
 
         columns = self.database.get_columns('category')
         data = [(c.name, c.null, c.primary_key, c.table)
@@ -476,3 +509,111 @@ class TestDBProxy(BaseTestCase):
         self.assertFalse(User._meta.database.is_closed())
         self.assertFalse(Tweet._meta.database.is_closed())
         sqlite_db.close()
+
+
+class Data(TestModel):
+    key = TextField()
+    value = TextField()
+
+    class Meta:
+        schema = 'main'
+
+
+class TestAttachDatabase(ModelTestCase):
+    database = db_loader('sqlite3')
+    requires = [Data]
+
+    def test_attach(self):
+        database = self.database
+        Data.create(key='k1', value='v1')
+        Data.create(key='k2', value='v2')
+
+        # Attach an in-memory cache database.
+        database.attach(':memory:', 'cache')
+
+        # Clone data into the in-memory cache.
+        class CacheData(Data):
+            class Meta:
+                schema = 'cache'
+
+        self.assertFalse(CacheData.table_exists())
+        CacheData.create_table(safe=False)
+        self.assertTrue(CacheData.table_exists())
+
+        (CacheData
+         .insert_from(Data.select(), fields=[Data.id, Data.key, Data.value])
+         .execute())
+
+        # Update the source data.
+        query = Data.update({Data.value: Data.value + '-x'})
+        self.assertEqual(query.execute(), 2)
+
+        # Verify the source data was updated.
+        query = Data.select(Data.key, Data.value).order_by(Data.key)
+        self.assertSQL(query, (
+            'SELECT "t1"."key", "t1"."value" '
+            'FROM "main"."data" AS "t1" '
+            'ORDER BY "t1"."key"'), [])
+        self.assertEqual([v for k, v in query.tuples()], ['v1-x', 'v2-x'])
+
+        # Verify the cached data reflects the original data, pre-update.
+        query = (CacheData
+                 .select(CacheData.key, CacheData.value)
+                 .order_by(CacheData.key))
+        self.assertSQL(query, (
+            'SELECT "t1"."key", "t1"."value" '
+            'FROM "cache"."cache_data" AS "t1" '
+            'ORDER BY "t1"."key"'), [])
+        self.assertEqual([v for k, v in query.tuples()], ['v1', 'v2'])
+
+        database.close()
+
+        # On re-connecting, the in-memory database will re-attached.
+        database.connect()
+
+        # Cache-Data table does not exist.
+        self.assertFalse(CacheData.table_exists())
+
+        # Double-check the sqlite master table.
+        curs = database.execute_sql('select * from cache.sqlite_master;')
+        self.assertEqual(curs.fetchall(), [])
+
+        # Because it's in-memory, the table needs to be re-created.
+        CacheData.create_table(safe=False)
+        self.assertEqual(CacheData.select().count(), 0)
+
+        # Original data is still there.
+        self.assertEqual(Data.select().count(), 2)
+
+    def test_attach_detach(self):
+        database = self.database
+        Data.create(key='k1', value='v1')
+        Data.create(key='k2', value='v2')
+
+        # Attach an in-memory cache database.
+        database.attach(':memory:', 'cache')
+        curs = database.execute_sql('select * from cache.sqlite_master')
+        self.assertEqual(curs.fetchall(), [])
+
+        self.assertFalse(database.attach(':memory:', 'cache'))
+        self.assertRaises(OperationalError, database.attach, 'foo.db', 'cache')
+
+        self.assertTrue(database.detach('cache'))
+        self.assertFalse(database.detach('cache'))
+        self.assertRaises(OperationalError, database.execute_sql,
+                          'select * from cache.sqlite_master')
+
+    def test_sqlite_schema_support(self):
+        class CacheData(Data):
+            class Meta:
+                schema = 'cache'
+
+        # Attach an in-memory cache database and create the cache table.
+        self.database.attach(':memory:', 'cache')
+        CacheData.create_table()
+
+        tables = self.database.get_tables()
+        self.assertEqual(tables, ['data'])
+
+        tables = self.database.get_tables(schema='cache')
+        self.assertEqual(tables, ['cache_data'])

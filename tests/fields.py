@@ -1,5 +1,6 @@
 import datetime
 import sqlite3
+import uuid
 from decimal import Decimal as D
 from decimal import ROUND_UP
 
@@ -13,9 +14,10 @@ from .base import IS_SQLITE
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db
+from .base import get_in_memory_db
 from .base import requires_models
+from .base import requires_sqlite
 from .base import skip_if
-from .base import skip_unless
 from .base_models import Tweet
 from .base_models import User
 
@@ -179,8 +181,21 @@ class DateModel(TestModel):
     date_time = DateTimeField(null=True)
 
 
+class CustomDateTimeModel(TestModel):
+    date_time = DateTimeField(formats=[
+        '%m/%d/%Y %I:%M %p',
+        '%Y-%m-%d %H:%M:%S'])
+
+
 class TestDateFields(ModelTestCase):
     requires = [DateModel]
+
+    @requires_models(CustomDateTimeModel)
+    def test_date_time_custom_format(self):
+        cdtm = CustomDateTimeModel.create(date_time='01/02/2003 01:37 PM')
+        cdtm_db = CustomDateTimeModel[cdtm.id]
+        self.assertEqual(cdtm_db.date_time,
+                         datetime.datetime(2003, 1, 2, 13, 37, 0))
 
     def test_date_fields(self):
         dt1 = datetime.datetime(2011, 1, 2, 11, 12, 13, 54321)
@@ -229,6 +244,27 @@ class TestDateFields(ModelTestCase):
             self.assertEqual(row, (
                 2011., 1., 2., 11., 12., 13.054321, 2012., 2., 3., 3., 13.,
                 37.))
+
+    def test_distinct_date_part(self):
+        years = (1980, 1990, 2000, 2010)
+        for i, year in enumerate(years):
+            for j in range(i + 1):
+                DateModel.create(date=datetime.date(year, i + 1, 1))
+
+        query = (DateModel
+                 .select(DateModel.date.year.distinct())
+                 .order_by(DateModel.date.year))
+        self.assertEqual([year for year, in query.tuples()],
+                         [1980, 1990, 2000, 2010])
+
+
+class U2(TestModel):
+    username = TextField()
+
+
+class T2(TestModel):
+    user = ForeignKeyField(U2, backref='tweets', on_delete='CASCADE')
+    content = TextField()
 
 
 class TestForeignKeyField(ModelTestCase):
@@ -283,6 +319,57 @@ class TestForeignKeyField(ModelTestCase):
         # We still preserve the metadata about the relationship.
         self.assertTrue(Pet.owner in Person._meta.backrefs)
 
+    @requires_models(U2, T2)
+    def test_on_delete_behavior(self):
+        if IS_SQLITE:
+            self.database.foreign_keys = 1
+
+        with self.database.atomic():
+            for username in ('u1', 'u2', 'u3'):
+                user = U2.create(username=username)
+                for i in range(3):
+                    T2.create(user=user, content='%s-%s' % (username, i))
+
+        self.assertEqual(T2.select().count(), 9)
+        U2.delete().where(U2.username == 'u2').execute()
+        self.assertEqual(T2.select().count(), 6)
+
+        query = (U2
+                 .select(U2.username, fn.COUNT(T2.id).alias('ct'))
+                 .join(T2, JOIN.LEFT_OUTER)
+                 .group_by(U2.username)
+                 .order_by(U2.username))
+        self.assertEqual([(u.username, u.ct) for u in query], [
+            ('u1', 3),
+            ('u3', 3)])
+
+
+class M1(TestModel):
+    name = CharField(primary_key=True)
+    m2 = DeferredForeignKey('M2', deferrable='INITIALLY DEFERRED',
+                            on_delete='CASCADE')
+
+class M2(TestModel):
+    name = CharField(primary_key=True)
+    m1 = ForeignKeyField(M1, deferrable='INITIALLY DEFERRED',
+                         on_delete='CASCADE')
+
+
+@skip_if(IS_MYSQL)
+class TestDeferredForeignKey(ModelTestCase):
+    requires = [M1, M2]
+
+    def test_deferred_foreign_key(self):
+        with self.database.atomic():
+            m1 = M1.create(name='m1', m2='m2')
+            m2 = M2.create(name='m2', m1='m1')
+
+        m1_db = M1.get(M1.name == 'm1')
+        self.assertEqual(m1_db.m2.name, 'm2')
+
+        m2_db = M2.get(M2.name == 'm2')
+        self.assertEqual(m2_db.m1.name, 'm1')
+
 
 class Composite(TestModel):
     first = CharField()
@@ -316,7 +403,7 @@ class TestFieldFunction(ModelTestCase):
                  .order_by(PB.name))
         self.assertSQL(query, (
             'SELECT "t1"."id", "t1"."name" '
-            'FROM "phonebook" AS "t1" '
+            'FROM "phone_book" AS "t1" '
             'WHERE (SUBSTR("t1"."name", ?, ?) = ?) '
             'ORDER BY "t1"."name"'), [1, 1, 'h'])
 
@@ -348,6 +435,27 @@ class TestIPField(ModelTestCase):
 
 class TestBitFields(ModelTestCase):
     requires = [Bits]
+
+    def test_bit_field_auto_flag(self):
+        class Bits2(TestModel):
+            flags = BitField()
+
+            f1 = flags.flag()  # Automatically gets 1.
+            f2 = flags.flag()  # 2
+            f4 = flags.flag()  # 4
+            f16 = flags.flag(16)
+            f32 = flags.flag()  # 32
+
+        b = Bits2()
+        self.assertEqual(b.flags, 0)
+
+        b.f1 = True
+        self.assertEqual(b.flags, 1)
+        b.f4 = True
+        self.assertEqual(b.flags, 5)
+
+        b.f32 = True
+        self.assertEqual(b.flags, 37)
 
     def test_bit_field_instance_flags(self):
         b = Bits()
@@ -423,17 +531,35 @@ class TestBitFields(ModelTestCase):
                 self.assertFalse(b_db.data.is_set(x))
 
 
-class TestBlobField(BaseTestCase):
+class BlobModel(TestModel):
+    data = BlobField()
+
+
+class TestBlobField(ModelTestCase):
+    requires = [BlobModel]
+
+    def test_blob_field(self):
+        b = BlobModel.create(data=b'\xff\x01')
+        b_db = BlobModel.get(BlobModel.data == b'\xff\x01')
+        self.assertEqual(b.id, b_db.id)
+
+        data = b_db.data
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, bytes):
+            data = bytes(data)
+        self.assertEqual(data, b'\xff\x01')
+
     def test_blob_on_proxy(self):
         db = Proxy()
-        class BlobModel(Model):
+        class NewBlobModel(Model):
             data = BlobField()
             class Meta:
                 database = db
 
         db_obj = SqliteDatabase(':memory:')
         db.initialize(db_obj)
-        self.assertTrue(BlobModel.data._constructor is sqlite3.Binary)
+        self.assertTrue(NewBlobModel.data._constructor is sqlite3.Binary)
 
 
 class BigModel(TestModel):
@@ -538,7 +664,7 @@ class TestFieldValueHandling(ModelTestCase):
         self.assertEqual(item.price, '10')
         self.assertEqual(item.multiplier, '1.1')
 
-    @skip_unless(IS_SQLITE)
+    @requires_sqlite
     @requires_models(Bare)
     def test_bare_model_adapt(self):
         b1 = Bare.create(key='k1', value=1)
@@ -556,3 +682,103 @@ class TestFieldValueHandling(ModelTestCase):
         b3_db = Bare.get(Bare.id == b3.id)
         self.assertEqual(b3_db.key, 'k3')
         self.assertTrue(b3_db.value is None)
+
+
+class UUIDModel(TestModel):
+    data = UUIDField(null=True)
+    bdata = BinaryUUIDField(null=True)
+
+
+class TestUUIDField(ModelTestCase):
+    requires = [UUIDModel]
+
+    def test_uuid_field(self):
+        uu = uuid.uuid4()
+        u = UUIDModel.create(data=uu)
+
+        u_db = UUIDModel.get(UUIDModel.id == u.id)
+        self.assertEqual(u_db.data, uu)
+        self.assertTrue(u_db.bdata is None)
+
+        u_db2 = UUIDModel.get(UUIDModel.data == uu)
+        self.assertEqual(u_db2.id, u.id)
+
+    def test_binary_uuid_field(self):
+        uu = uuid.uuid4()
+        u = UUIDModel.create(bdata=uu)
+
+        u_db = UUIDModel.get(UUIDModel.id == u.id)
+        self.assertEqual(u_db.bdata, uu)
+        self.assertTrue(u_db.data is None)
+
+        u_db2 = UUIDModel.get(UUIDModel.bdata == uu)
+        self.assertEqual(u_db2.id, u.id)
+
+
+class ListField(TextField):
+    def db_value(self, value):
+        return ','.join(value) if value else ''
+
+    def python_value(self, value):
+        return value.split(',') if value else []
+
+
+class Todo(TestModel):
+    content = TextField()
+    tags = ListField()
+
+
+class TestCustomField(ModelTestCase):
+    requires = [Todo]
+
+    def test_custom_field(self):
+        t1 = Todo.create(content='t1', tags=['t1-a', 't1-b'])
+        t2 = Todo.create(content='t2', tags=[])
+
+        t1_db = Todo.get(Todo.id == t1.id)
+        self.assertEqual(t1_db.tags, ['t1-a', 't1-b'])
+
+        t2_db = Todo.get(Todo.id == t2.id)
+        self.assertEqual(t2_db.tags, [])
+
+        t1_db = Todo.get(Todo.tags == AsIs(['t1-a', 't1-b']))
+        self.assertEqual(t1_db.id, t1.id)
+
+        t2_db = Todo.get(Todo.tags == AsIs([]))
+        self.assertEqual(t2_db.id, t2.id)
+
+
+class UpperField(TextField):
+    def db_value(self, value):
+        return fn.UPPER(value)
+
+
+class UpperModel(TestModel):
+    name = UpperField()
+
+
+class TestSQLFunctionDBValue(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [UpperModel]
+
+    def test_sql_function_db_value(self):
+        # Verify that the db function is applied as part of an INSERT.
+        um = UpperModel.create(name='huey')
+        um_db = UpperModel.get(UpperModel.id == um.id)
+        self.assertEqual(um_db.name, 'HUEY')
+
+        # Verify that the db function is applied as part of an UPDATE.
+        um_db.name = 'zaizee'
+        um_db.save()
+
+        # Ensure that the name was updated correctly.
+        um_db2 = UpperModel.get(UpperModel.id == um.id)
+        self.assertEqual(um_db2.name, 'ZAIZEE')
+
+        # Verify that the db function is applied in a WHERE expression.
+        um_db3 = UpperModel.get(UpperModel.name == 'zaiZee')
+        self.assertEqual(um_db3.id, um.id)
+
+        # If we nest the field in a function, the conversion is not applied.
+        expr = fn.SUBSTR(UpperModel.name, 1, 1) == 'z'
+        self.assertRaises(UpperModel.DoesNotExist, UpperModel.get, expr)

@@ -221,11 +221,16 @@ class SchemaMigrator(object):
         return ctx
 
     def add_inline_fk_sql(self, ctx, field):
-        return (ctx
-                .literal(' REFERENCES ')
-                .sql(Entity(field.rel_model._meta.table_name))
-                .literal(' ')
-                .sql(EnclosedNodeList((Entity(field.rel_field.column_name),))))
+        ctx = (ctx
+               .literal(' REFERENCES ')
+               .sql(Entity(field.rel_model._meta.table_name))
+               .literal(' ')
+               .sql(EnclosedNodeList((Entity(field.rel_field.column_name),))))
+        if field.on_delete is not None:
+            ctx = ctx.literal(' ON DELETE %s' % field.on_delete)
+        if field.on_update is not None:
+            ctx = ctx.literal(' ON UPDATE %s' % field.on_update)
+        return ctx
 
     @operation
     def add_foreign_key_constraint(self, table, column_name, rel, rel_column,
@@ -261,7 +266,7 @@ class SchemaMigrator(object):
 
         is_foreign_key = isinstance(field, ForeignKeyField)
         if is_foreign_key and not field.rel_field:
-            raise ValueError('Foreign keys must specify a `rel_field`.')
+            raise ValueError('Foreign keys must specify a `field`.')
 
         operations = [self.alter_add_column(table, column_name, field)]
 
@@ -283,8 +288,9 @@ class SchemaMigrator(object):
                     field.on_update))
 
         if field.index or field.unique:
+            using = getattr(field, 'index_type', None)
             operations.append(self.add_index(table, (column_name,),
-                                             field.unique))
+                                             field.unique, using))
 
         return operations
 
@@ -339,15 +345,13 @@ class SchemaMigrator(object):
                 .sql(Entity(new_name)))
 
     @operation
-    def add_index(self, table, columns, unique=False):
+    def add_index(self, table, columns, unique=False, using=None):
         ctx = self.make_context()
         index_name = make_index_name(table, columns)
-        return (ctx
-                .literal('CREATE UNIQUE INDEX ' if unique else 'CREATE INDEX ')
-                .sql(Entity(index_name))
-                .literal(' ON ')
-                .sql(Entity(table))
-                .sql(EnclosedNodeList([Entity(column) for column in columns])))
+        table_obj = Table(table)
+        cols = [getattr(table_obj.c, column) for column in columns]
+        index = Index(index_name, table_obj, cols, unique=unique, using=using)
+        return ctx.sql(index)
 
     @operation
     def drop_index(self, table, index_name):

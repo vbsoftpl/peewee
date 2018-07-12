@@ -3,6 +3,7 @@ from functools import wraps
 import datetime
 import logging
 import os
+import re
 import unittest
 try:
     from unittest import mock
@@ -10,6 +11,7 @@ except ImportError:
     from .libs import mock
 
 from peewee import *
+from peewee import sqlite3
 from playhouse.mysql_ext import MySQLConnectorDatabase
 
 
@@ -39,7 +41,7 @@ def db_loader(engine, name='peewee_test', db_class=None, **params):
 
 
 def get_in_memory_db(**params):
-    return db_loader('sqlite3', ':memory:', **params)
+    return db_loader('sqlite3', ':memory:', thread_safe=False, **params)
 
 
 BACKEND = os.environ.get('PEEWEE_TEST_BACKEND') or 'sqlite'
@@ -78,9 +80,37 @@ def new_connection():
 db = new_connection()
 
 
+# Database-specific feature flags.
+IS_SQLITE_OLD = IS_SQLITE and sqlite3.sqlite_version_info < (3, 18)
+IS_SQLITE_15 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 15)
+IS_SQLITE_24 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 24)
+IS_SQLITE_25 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 25)
+IS_SQLITE_9 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 9)
+IS_MYSQL_ADVANCED_FEATURES = False
+if IS_MYSQL:
+    conn = db.connection()
+    try:
+        # pymysql
+        server_info = conn.server_version
+        if re.search('(8\.\d+\.\d+|10\.[2-9]\.)', server_info):
+            IS_MYSQL_ADVANCED_FEATURES = True
+    except AttributeError:
+        try:
+            # mysql-connector
+            server_info = conn.get_server_version()
+            IS_MYSQL_ADVANCED_FEATURES = (server_info[0] == 8 or
+                                          server_info[:2] >= (10, 2))
+        except AttributeError:
+            logger.warning('Could not determine mysql server version.')
+    db.close()
+    if not IS_MYSQL_ADVANCED_FEATURES:
+        logger.warning('MySQL too old to test certain advanced features.')
+
+
 class TestModel(Model):
     class Meta:
         database = db
+        legacy_table_names = False
 
 
 def __sql__(q, **state):
@@ -226,34 +256,22 @@ def requires_models(*models):
     return decorator
 
 
-def skip_if(expr):
+def skip_if(expr, reason='n/a'):
     def decorator(method):
-        @wraps(method)
-        def inner(self):
-            should_skip = expr() if callable(expr) else expr
-            if not should_skip:
-                return method(self)
-            elif VERBOSITY > 1:
-                print('Skipping %s test.' % method.__name__)
-        return inner
+        return unittest.skipIf(expr, reason)(method)
     return decorator
 
 
-def skip_unless(expr):
-    return skip_if((lambda: not expr()) if callable(expr) else not expr)
-
-
-def skip_case_if(expr):
-    def decorator(klass):
-        should_skip = expr() if callable(expr) else expr
-        if not should_skip:
-            return klass
-        elif VERBOSITY > 1:
-            print('Skipping %s test.' % klass.__name__)
-            class Dummy(object): pass
-            return Dummy
+def skip_unless(expr, reason='n/a'):
+    def decorator(method):
+        return unittest.skipUnless(expr, reason)(method)
     return decorator
 
+def requires_sqlite(method):
+    return skip_unless(IS_SQLITE, 'requires sqlite')(method)
 
-def skip_case_unless(expr):
-    return skip_case_if((lambda: not expr()) if callable(expr) else not expr)
+def requires_mysql(method):
+    return skip_unless(IS_MYSQL, 'requires mysql')(method)
+
+def requires_postgresql(method):
+    return skip_unless(IS_POSTGRESQL, 'requires postgresql')(method)

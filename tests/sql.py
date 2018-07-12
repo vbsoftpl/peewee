@@ -1,15 +1,15 @@
 import datetime
+import re
 
 from peewee import *
 from peewee import Expression
 
 from .base import BaseTestCase
-from .base import IS_MYSQL
-from .base import IS_POSTGRESQL
-from .base import IS_SQLITE
 from .base import TestModel
 from .base import db
-from .base import skip_unless
+from .base import requires_mysql
+from .base import requires_sqlite
+from .base import __sql__
 
 
 User = Table('users')
@@ -27,6 +27,17 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t1"."id", "t1"."username" '
             'FROM "users" AS "t1" '
             'WHERE ("t1"."username" = ?)'), ['foo'])
+
+    def test_select_subselect_function(self):
+        exists = fn.EXISTS(Tweet
+                           .select(Tweet.c.id)
+                           .where(Tweet.c.user_id == User.c.id))
+        query = User.select(User.c.username, exists.alias('has_tweet'))
+        self.assertSQL(query, (
+            'SELECT "t1"."username", EXISTS('
+            'SELECT "t2"."id" FROM "tweets" AS "t2" '
+            'WHERE ("t2"."user_id" = "t1"."id")) AS "has_tweet" '
+            'FROM "users" AS "t1"'), [])
 
     def test_select_extend(self):
         query = User.select(User.c.id, User.c.username)
@@ -195,6 +206,69 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t2"."username" FROM "users" AS "t2" '
             'WHERE ("t2"."id" IN "user_ids")'), [])
 
+    def test_two_ctes(self):
+        c1 = User.select(User.c.id).cte('user_ids')
+        c2 = User.select(User.c.username).cte('user_names')
+        query = (User
+                 .select(c1.c.id, c2.c.username)
+                 .where((c1.c.id == User.c.id) &
+                        (c2.c.username == User.c.username))
+                 .with_cte(c1, c2))
+        self.assertSQL(query, (
+            'WITH "user_ids" AS (SELECT "t1"."id" FROM "users" AS "t1"), '
+            '"user_names" AS (SELECT "t1"."username" FROM "users" AS "t1") '
+            'SELECT "user_ids"."id", "user_names"."username" '
+            'FROM "users" AS "t2" '
+            'WHERE (("user_ids"."id" = "t2"."id") AND '
+            '("user_names"."username" = "t2"."username"))'), [])
+
+    def test_select_from_cte(self):
+        # Use the "select_from()" helper on the CTE object.
+        cte = User.select(User.c.username).cte('user_cte')
+        query = cte.select_from(cte.c.username).order_by(cte.c.username)
+        self.assertSQL(query, (
+            'WITH "user_cte" AS (SELECT "t1"."username" FROM "users" AS "t1") '
+            'SELECT "user_cte"."username" FROM "user_cte" '
+            'ORDER BY "user_cte"."username"'), [])
+
+        # Test selecting from multiple CTEs, which is done manually.
+        c1 = User.select(User.c.username).where(User.c.is_admin == 1).cte('c1')
+        c2 = User.select(User.c.username).where(User.c.is_staff == 1).cte('c2')
+        query = (Select((c1, c2), (c1.c.username, c2.c.username))
+                 .with_cte(c1, c2))
+        self.assertSQL(query, (
+            'WITH "c1" AS ('
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."is_admin" = ?)), '
+            '"c2" AS ('
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."is_staff" = ?)) '
+            'SELECT "c1"."username", "c2"."username" FROM "c1", "c2"'), [1, 1])
+
+    def test_fibonacci_cte(self):
+        q1 = Select(columns=(
+            Value(1).alias('n'),
+            Value(0).alias('fib_n'),
+            Value(1).alias('next_fib_n'))).cte('fibonacci', recursive=True)
+        n = (q1.c.n + 1).alias('n')
+        rterm = Select(columns=(
+            n,
+            q1.c.next_fib_n,
+            q1.c.fib_n + q1.c.next_fib_n)).from_(q1).where(n < 10)
+
+        cte = q1.union_all(rterm)
+        query = cte.select_from(cte.c.n, cte.c.fib_n)
+        self.assertSQL(query, (
+            'WITH RECURSIVE "fibonacci" AS ('
+            'SELECT ? AS "n", ? AS "fib_n", ? AS "next_fib_n" '
+            'UNION ALL '
+            'SELECT ("fibonacci"."n" + ?) AS "n", "fibonacci"."next_fib_n", '
+            '("fibonacci"."fib_n" + "fibonacci"."next_fib_n") '
+            'FROM "fibonacci" '
+            'WHERE ("n" < ?)) '
+            'SELECT "fibonacci"."n", "fibonacci"."fib_n" '
+            'FROM "fibonacci"'), [1, 0, 1, 1, 10])
+
     def test_complex_select(self):
         Order = Table('orders', columns=(
             'region',
@@ -269,6 +343,34 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "U2"."id" '
             'FROM "users" AS "U2" '
             'WHERE ("U2"."superuser" = ?)'), ['charlie', True, False])
+
+    def test_compound_operations(self):
+        admin = (User
+                 .select(User.c.username, Value('admin').alias('role'))
+                 .where(User.c.is_admin == True))
+        editors = (User
+                   .select(User.c.username, Value('editor').alias('role'))
+                   .where(User.c.is_editor == True))
+
+        union = admin.union(editors)
+        self.assertSQL(union, (
+            'SELECT "t1"."username", ? AS "role" '
+            'FROM "users" AS "t1" '
+            'WHERE ("t1"."is_admin" = ?) '
+            'UNION '
+            'SELECT "t2"."username", ? AS "role" '
+            'FROM "users" AS "t2" '
+            'WHERE ("t2"."is_editor" = ?)'), ['admin', 1, 'editor', 1])
+
+        xcept = editors.except_(admin)
+        self.assertSQL(xcept, (
+            'SELECT "t1"."username", ? AS "role" '
+            'FROM "users" AS "t1" '
+            'WHERE ("t1"."is_editor" = ?) '
+            'EXCEPT '
+            'SELECT "t2"."username", ? AS "role" '
+            'FROM "users" AS "t2" '
+            'WHERE ("t2"."is_admin" = ?)'), ['editor', 1, 'admin', 1])
 
     def test_join_on_query(self):
         inner = User.select(User.c.id).alias('j1')
@@ -365,7 +467,7 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "users" ("admin", "superuser", "username") '
             'VALUES (?, ?, ?)'), [True, False, 'charlie'])
 
-    @skip_unless(IS_SQLITE)
+    @requires_sqlite
     def test_replace_sqlite(self):
         query = User.replace({
             User.c.username: 'charlie',
@@ -374,7 +476,7 @@ class TestInsertQuery(BaseTestCase):
             'INSERT OR REPLACE INTO "users" ("superuser", "username") '
             'VALUES (?, ?)'), [False, 'charlie'])
 
-    @skip_unless(IS_MYSQL)
+    @requires_mysql
     def test_replace_mysql(self):
         query = User.replace({
             User.c.username: 'charlie',
@@ -482,6 +584,29 @@ class TestUpdateQuery(BaseTestCase):
             'GROUP BY "users"."id" '
             'HAVING ("ct" > ?)))'), [0, True, 100])
 
+    def test_update_from(self):
+        data = [(1, 'u1-x'), (2, 'u2-x')]
+        vl = ValuesList(data, columns=('id', 'username'), alias='tmp')
+        query = (User
+                 .update(username=QualifiedNames(vl.c.username))
+                 .from_(vl)
+                 .where(QualifiedNames(User.c.id == vl.c.id)))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = "tmp"."username" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "tmp"("id", "username") '
+            'WHERE ("users"."id" = "tmp"."id")'), [1, 'u1-x', 2, 'u2-x'])
+
+        subq = vl.select(vl.c.id, vl.c.username)
+        query = (User
+                 .update({User.c.username: QualifiedNames(subq.c.username)})
+                 .from_(subq)
+                 .where(QualifiedNames(User.c.id == subq.c.id)))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = "t1"."username" FROM ('
+            'SELECT "tmp"."id", "tmp"."username" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "tmp"("id", "username")) AS "t1" '
+            'WHERE ("users"."id" = "t1"."id")'), [1, 'u1-x', 2, 'u2-x'])
+
     def test_update_returning(self):
         query = (User
                  .update({User.c.is_admin: True})
@@ -500,8 +625,8 @@ class TestDeleteQuery(BaseTestCase):
                  .limit(3))
         self.assertSQL(
             query,
-            'DELETE FROM "users" WHERE ("username" != ?) LIMIT 3',
-            ['charlie'])
+            'DELETE FROM "users" WHERE ("username" != ?) LIMIT ?',
+            ['charlie', 3])
 
     def test_delete_subquery(self):
         count = fn.COUNT(Tweet.c.id).alias('ct')
@@ -558,6 +683,48 @@ Register = Table('register', ('id', 'value', 'category'))
 
 
 class TestWindowFunctions(BaseTestCase):
+    def test_partition_unordered(self):
+        partition = [Register.category]
+        query = (Register
+                 .select(
+                     Register.category,
+                     Register.value,
+                     fn.AVG(Register.value).over(partition_by=partition))
+                 .order_by(Register.id))
+        self.assertSQL(query, (
+            'SELECT "t1"."category", "t1"."value", AVG("t1"."value") '
+            'OVER (PARTITION BY "t1"."category") '
+            'FROM "register" AS "t1" ORDER BY "t1"."id"'), [])
+
+    def test_ordered_unpartitioned(self):
+        query = (Register
+                 .select(
+                     Register.value,
+                     fn.RANK().over(order_by=[Register.value])))
+        self.assertSQL(query, (
+            'SELECT "t1"."value", RANK() OVER (ORDER BY "t1"."value") '
+            'FROM "register" AS "t1"'), [])
+
+    def test_ordered_partitioned(self):
+        query = Register.select(
+            Register.value,
+            fn.SUM(Register.value).over(
+                order_by=Register.id,
+                partition_by=Register.category).alias('rsum'))
+        self.assertSQL(query, (
+            'SELECT "t1"."value", SUM("t1"."value") '
+            'OVER (PARTITION BY "t1"."category" ORDER BY "t1"."id") AS "rsum" '
+            'FROM "register" AS "t1"'), [])
+
+    def test_empty_over(self):
+        query = (Register
+                 .select(Register.value, fn.LAG(Register.value, 1).over())
+                 .order_by(Register.value))
+        self.assertSQL(query, (
+            'SELECT "t1"."value", LAG("t1"."value", ?) OVER () '
+            'FROM "register" AS "t1" '
+            'ORDER BY "t1"."value"'), [1])
+
     def test_frame(self):
         query = (Register
                  .select(
@@ -576,7 +743,7 @@ class TestWindowFunctions(BaseTestCase):
                  .select(Register.value, fn.AVG(Register.value).over(
                      partition_by=[Register.category],
                      order_by=[Register.value],
-                     start=SQL('CURRENT ROW'),
+                     start=Window.CURRENT_ROW,
                      end=Window.following())))
         self.assertSQL(query, (
             'SELECT "t1"."value", AVG("t1"."value") '
@@ -585,18 +752,99 @@ class TestWindowFunctions(BaseTestCase):
             'ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) '
             'FROM "register" AS "t1"'), [])
 
-    def test_partition_unordered(self):
-        partition = [Register.category]
-        query = (Register
-                 .select(
-                     Register.category,
-                     Register.value,
-                     fn.AVG(Register.value).over(partition_by=partition))
-                 .order_by(Register.id))
+    def test_frame_types(self):
+        def assertFrame(over_kwargs, expected):
+            query = Register.select(
+                Register.value,
+                fn.SUM(Register.value).over(**over_kwargs))
+            sql, params = __sql__(query)
+            match_obj = re.search('OVER \((.*?)\) FROM', sql)
+            self.assertTrue(match_obj is not None)
+            self.assertEqual(match_obj.groups()[0], expected)
+            self.assertEqual(params, [])
+
+        # No parameters -- empty OVER().
+        assertFrame({}, (''))
+        # Explicitly specify RANGE / ROWS frame-types.
+        assertFrame({'frame_type': Window.RANGE}, 'RANGE UNBOUNDED PRECEDING')
+        assertFrame({'frame_type': Window.ROWS}, 'ROWS UNBOUNDED PRECEDING')
+
+        # Start and end boundaries.
+        assertFrame({'start': Window.preceding(), 'end': Window.following()},
+                    'ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING')
+        assertFrame({
+            'start': Window.preceding(),
+            'end': Window.following(),
+            'frame_type': Window.RANGE,
+        }, 'RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING')
+        assertFrame({
+            'start': Window.preceding(),
+            'end': Window.following(),
+            'frame_type': Window.ROWS,
+        }, 'ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING')
+
+        # Start boundary.
+        assertFrame({'start': Window.preceding()}, 'ROWS UNBOUNDED PRECEDING')
+        assertFrame({'start': Window.preceding(), 'frame_type': Window.RANGE},
+                    'RANGE UNBOUNDED PRECEDING')
+        assertFrame({'start': Window.preceding(), 'frame_type': Window.ROWS},
+                    'ROWS UNBOUNDED PRECEDING')
+
+        # Ordered or partitioned.
+        assertFrame({'order_by': Register.value}, 'ORDER BY "t1"."value"')
+        assertFrame({'frame_type': Window.RANGE, 'order_by': Register.value},
+                    'ORDER BY "t1"."value" RANGE UNBOUNDED PRECEDING')
+        assertFrame({'frame_type': Window.ROWS, 'order_by': Register.value},
+                    'ORDER BY "t1"."value" ROWS UNBOUNDED PRECEDING')
+        assertFrame({'partition_by': Register.category},
+                    'PARTITION BY "t1"."category"')
+        assertFrame({
+            'frame_type': Window.RANGE,
+            'partition_by': Register.category,
+        }, 'PARTITION BY "t1"."category" RANGE UNBOUNDED PRECEDING')
+        assertFrame({
+            'frame_type': Window.ROWS,
+            'partition_by': Register.category,
+        }, 'PARTITION BY "t1"."category" ROWS UNBOUNDED PRECEDING')
+
+        # Ordering and boundaries.
+        assertFrame({'order_by': Register.value, 'start': Window.CURRENT_ROW,
+                     'end': Window.following()},
+                    ('ORDER BY "t1"."value" '
+                     'ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING'))
+        assertFrame({'order_by': Register.value, 'start': Window.CURRENT_ROW,
+                     'end': Window.following(), 'frame_type': Window.RANGE},
+                    ('ORDER BY "t1"."value" '
+                     'RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING'))
+        assertFrame({'order_by': Register.value, 'start': Window.CURRENT_ROW,
+                     'end': Window.following(), 'frame_type': Window.ROWS},
+                    ('ORDER BY "t1"."value" '
+                     'ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING'))
+
+    def test_running_total(self):
+        EventLog = Table('evtlog', ('id', 'timestamp', 'data'))
+
+        w = fn.SUM(EventLog.timestamp).over(order_by=[EventLog.timestamp])
+        query = (EventLog
+                 .select(EventLog.timestamp, EventLog.data, w.alias('elapsed'))
+                 .order_by(EventLog.timestamp))
         self.assertSQL(query, (
-            'SELECT "t1"."category", "t1"."value", AVG("t1"."value") '
-            'OVER (PARTITION BY "t1"."category") '
-            'FROM "register" AS "t1" ORDER BY "t1"."id"'), [])
+            'SELECT "t1"."timestamp", "t1"."data", '
+            'SUM("t1"."timestamp") OVER (ORDER BY "t1"."timestamp") '
+            'AS "elapsed" '
+            'FROM "evtlog" AS "t1" ORDER BY "t1"."timestamp"'), [])
+
+        w = fn.SUM(EventLog.timestamp).over(
+            order_by=[EventLog.timestamp],
+            partition_by=[EventLog.data])
+        query = (EventLog
+                 .select(EventLog.timestamp, EventLog.data, w.alias('elapsed'))
+                 .order_by(EventLog.timestamp))
+        self.assertSQL(query, (
+            'SELECT "t1"."timestamp", "t1"."data", '
+            'SUM("t1"."timestamp") OVER '
+            '(PARTITION BY "t1"."data" ORDER BY "t1"."timestamp") AS "elapsed"'
+            ' FROM "evtlog" AS "t1" ORDER BY "t1"."timestamp"'), [])
 
     def test_named_window(self):
         window = Window(partition_by=[Register.category])
@@ -643,23 +891,103 @@ class TestWindowFunctions(BaseTestCase):
             'WINDOW w1 AS (PARTITION BY "t1"."category"), '
             'w2 AS (ORDER BY "t1"."value")'), [])
 
-    def test_ordered_unpartitioned(self):
-        query = (Register
-                 .select(
-                     Register.value,
-                     fn.RANK().over(order_by=[Register.value])))
-        self.assertSQL(query, (
-            'SELECT "t1"."value", RANK() OVER (ORDER BY "t1"."value") '
-            'FROM "register" AS "t1"'), [])
+    def test_alias_window(self):
+        w = Window(order_by=Register.value).alias('wx')
+        query = Register.select(Register.value, fn.RANK().over(w)).window(w)
 
-    def test_empty_over(self):
-        query = (Register
-                 .select(Register.value, fn.LAG(Register.value, 1).over())
-                 .order_by(Register.value))
+        # We can re-alias the window and it's updated alias is reflected
+        # correctly in the final query.
+        w.alias('wz')
         self.assertSQL(query, (
-            'SELECT "t1"."value", LAG("t1"."value", ?) OVER () '
+            'SELECT "t1"."value", RANK() OVER wz '
             'FROM "register" AS "t1" '
-            'ORDER BY "t1"."value"'), [1])
+            'WINDOW wz AS (ORDER BY "t1"."value")'), [])
+
+    def test_reuse_window(self):
+        EventLog = Table('evt', ('id', 'timestamp', 'key'))
+        window = Window(partition_by=[EventLog.key],
+                        order_by=[EventLog.timestamp])
+        query = (EventLog
+                 .select(EventLog.timestamp, EventLog.key,
+                         fn.NTILE(4).over(window).alias('quartile'),
+                         fn.NTILE(5).over(window).alias('quintile'),
+                         fn.NTILE(100).over(window).alias('percentile'))
+                 .order_by(EventLog.timestamp)
+                 .window(window))
+        self.assertSQL(query, (
+            'SELECT "t1"."timestamp", "t1"."key", '
+            'NTILE(?) OVER w AS "quartile", '
+            'NTILE(?) OVER w AS "quintile", '
+            'NTILE(?) OVER w AS "percentile" '
+            'FROM "evt" AS "t1" '
+            'WINDOW w AS ('
+            'PARTITION BY "t1"."key" ORDER BY "t1"."timestamp") '
+            'ORDER BY "t1"."timestamp"'), [4, 5, 100])
+
+    def test_filter_clause(self):
+        condsum = fn.SUM(Register.value).filter(Register.value > 1).over(
+            order_by=[Register.id], partition_by=[Register.category],
+            start=Window.preceding(1))
+        query = (Register
+                 .select(Register.category, Register.value, condsum)
+                 .order_by(Register.category))
+        self.assertSQL(query, (
+            'SELECT "t1"."category", "t1"."value", SUM("t1"."value") FILTER ('
+            'WHERE ("t1"."value" > ?)) OVER (PARTITION BY "t1"."category" '
+            'ORDER BY "t1"."id" ROWS 1 PRECEDING) '
+            'FROM "register" AS "t1" '
+            'ORDER BY "t1"."category"'), [1])
+
+
+class TestValuesList(BaseTestCase):
+    _data = [(1, 'one'), (2, 'two'), (3, 'three')]
+
+    def test_values_list(self):
+        vl = ValuesList(self._data)
+
+        query = vl.select(SQL('*'))
+        self.assertSQL(query, (
+            'SELECT * FROM (VALUES (?, ?), (?, ?), (?, ?)) AS "t1"'),
+            [1, 'one', 2, 'two', 3, 'three'])
+
+    def test_values_list_named_columns(self):
+        vl = ValuesList(self._data).columns('idx', 'name')
+        query = (vl
+                 .select(vl.c.idx, vl.c.name)
+                 .order_by(vl.c.idx))
+        self.assertSQL(query, (
+            'SELECT "t1"."idx", "t1"."name" '
+            'FROM (VALUES (?, ?), (?, ?), (?, ?)) AS "t1"("idx", "name") '
+            'ORDER BY "t1"."idx"'), [1, 'one', 2, 'two', 3, 'three'])
+
+    def test_named_values_list(self):
+        vl = ValuesList(self._data, ['idx', 'name']).alias('vl')
+        query = (vl
+                 .select(vl.c.idx, vl.c.name)
+                 .order_by(vl.c.idx))
+        self.assertSQL(query, (
+            'SELECT "vl"."idx", "vl"."name" '
+            'FROM (VALUES (?, ?), (?, ?), (?, ?)) AS "vl"("idx", "name") '
+            'ORDER BY "vl"."idx"'), [1, 'one', 2, 'two', 3, 'three'])
+
+    def test_docs_examples(self):
+        data = [(1, 'first'), (2, 'second')]
+        vl = ValuesList(data, columns=('idx', 'name'))
+        query = (vl
+                 .select(vl.c.idx, vl.c.name)
+                 .order_by(vl.c.idx))
+        self.assertSQL(query, (
+            'SELECT "t1"."idx", "t1"."name" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "t1"("idx", "name") '
+            'ORDER BY "t1"."idx"'), [1, 'first', 2, 'second'])
+
+        vl = ValuesList([(1, 'first'), (2, 'second')])
+        vl = vl.columns('idx', 'name').alias('v')
+        query = vl.select(vl.c.idx, vl.c.name)
+        self.assertSQL(query, (
+            'SELECT "v"."idx", "v"."name" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "v"("idx", "name")'),
+            [1, 'first', 2, 'second'])
 
 
 class TestCaseFunction(BaseTestCase):
@@ -723,6 +1051,20 @@ class TestSelectFeatures(BaseTestCase):
         query = Person.select(Person.name).distinct()
         self.assertSQL(query,
                        'SELECT DISTINCT "t1"."name" FROM "person" AS "t1"', [])
+
+    def test_distinct_count(self):
+        query = Person.select(fn.COUNT(Person.name.distinct()))
+        self.assertSQL(query, (
+            'SELECT COUNT(DISTINCT "t1"."name") FROM "person" AS "t1"'), [])
+
+    def test_filtered_count(self):
+        filtered_count = (fn.COUNT(Person.name)
+                          .filter(Person.dob < datetime.date(2000, 1, 1)))
+        query = Person.select(fn.COUNT(Person.name), filtered_count)
+        self.assertSQL(query, (
+            'SELECT COUNT("t1"."name"), COUNT("t1"."name") '
+            'FILTER (WHERE ("t1"."dob" < ?)) '
+            'FROM "person" AS "t1"'), [datetime.date(2000, 1, 1)])
 
     def test_for_update(self):
         query = (Person

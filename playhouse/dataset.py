@@ -22,12 +22,18 @@ if sys.version_info[0] == 3:
 
 class DataSet(object):
     def __init__(self, url, bare_fields=False):
-        self._url = url
-        parse_result = urlparse(url)
-        self._database_path = parse_result.path[1:]
+        if isinstance(url, Database):
+            self._url = None
+            self._database = url
+            self._database_path = self._database.database
+        else:
+            self._url = url
+            parse_result = urlparse(url)
+            self._database_path = parse_result.path[1:]
 
-        # Connect to the database.
-        self._database = connect(url)
+            # Connect to the database.
+            self._database = connect(url)
+
         self._database.connect()
 
         # Introspect the database and generate models.
@@ -84,6 +90,8 @@ class DataSet(object):
                 dependencies.extend([
                     related._meta.table_name for _, related, _ in
                     model_class._meta.model_graph()])
+            else:
+                dependencies.extend(self.get_table_dependencies(table))
         else:
             dependencies = None  # Update all tables.
         updated = self._introspector.generate_models(
@@ -91,6 +99,19 @@ class DataSet(object):
             table_names=dependencies,
             literal_column_names=True)
         self._models.update(updated)
+
+    def get_table_dependencies(self, table):
+        stack = [table]
+        accum = []
+        seen = set()
+        while stack:
+            table = stack.pop()
+            for fk_meta in self._database.get_foreign_keys(table):
+                dest = fk_meta.dest_table
+                if dest not in seen:
+                    stack.append(dest)
+                    accum.append(dest)
+        return accum
 
     def __enter__(self):
         self.connect()

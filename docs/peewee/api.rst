@@ -1,5 +1,7 @@
 .. _api:
 
+.. include:: help-request.rst
+
 API Documentation
 =================
 
@@ -10,7 +12,9 @@ Database
 
 .. py:class:: Database(database[, thread_safe=True[, autorollback=False[, field_types=None[, operations=None[, **kwargs]]]]])
 
-    :param str database: Database name or filename for SQLite.
+    :param str database: Database name or filename for SQLite (or ``None`` to
+        :ref:`defer initialization <deferring_initialization>`, in which case
+        you must call :py:meth:`Database.init`, specifying the database name).
     :param bool thread_safe: Whether to store connection state in a
         thread-local.
     :param bool autorollback: Automatically rollback queries that fail when
@@ -29,14 +33,40 @@ Database
     * Introspection
 
     .. note::
-
         The database can be instantiated with ``None`` as the database name if
         the database is not known until run-time. In this way you can create a
         database instance and then configure it elsewhere when the settings are
-        known. This is called *deferred* initialization.
+        known. This is called :ref:`deferred* initialization <deferring_initialization>`.
 
-        To initialize a database that has been *deferred*, use the
-        :py:meth:`~Database.init` method.
+    Examples:
+
+    .. code-block:: python
+
+        # Sqlite database using WAL-mode and 32MB page-cache.
+        db = SqliteDatabase('app.db', pragmas={
+            'journal_mode': 'wal',
+            'cache_size': -32 * 1000})
+
+        # Postgresql database on remote host.
+        db = PostgresqlDatabase('my_app', user='postgres', host='10.1.0.3',
+                                password='secret')
+
+    Deferred initialization example:
+
+    .. code-block:: python
+
+        db = PostgresqlDatabase(None)
+
+        class BaseModel(Model):
+            class Meta:
+                database = db
+
+        # Read database connection info from env, for example:
+        db_name = os.environ['DATABASE']
+        db_host = os.environ['PGHOST']
+
+        # Initialize database.
+        db.init(db_name, host=db_host, user='postgres')
 
     .. py:attribute:: param = '?'
 
@@ -54,7 +84,8 @@ Database
             database driver when a connection is created, for example
             ``password``, ``host``, etc.
 
-        Initialize a *deferred* database.
+        Initialize a *deferred* database. See :ref:`deferring_initialization`
+        for more info.
 
     .. py:method:: __enter__()
 
@@ -109,6 +140,8 @@ Database
         uses to encapsulate a database connection.
 
     .. py:method:: cursor([commit=None])
+
+        :param commit: For internal use.
 
         Return a ``cursor`` object on the current connection. If a connection
         is not open, one will be opened. The cursor will be whatever the
@@ -456,8 +489,8 @@ Database
 
 .. py:class:: SqliteDatabase(database[, pragmas=None[, timeout=5[, **kwargs]]])
 
-    :param list pragmas: A list of 2-tuples containing pragma key and value to
-        set every time a connection is opened.
+    :param pragmas: Either a dictionary or a list of 2-tuples containing
+        pragma key and value to set every time a connection is opened.
     :param timeout: Set the busy-timeout on the SQLite driver (in seconds).
 
     Sqlite database implementation. :py:class:`SqliteDatabase` that provides
@@ -465,15 +498,20 @@ Database
 
     * Register custom aggregates, collations and functions
     * Load C extensions
-    * Advanced transactions (specify isolation level)
+    * Advanced transactions (specify lock type)
     * For even more features, see :py:class:`SqliteExtDatabase`.
 
-    Example of using PRAGMAs::
+    Example of initializing a database and configuring some PRAGMAs:
+
+    .. code-block:: python
 
         db = SqliteDatabase('my_app.db', pragmas=(
             ('cache_size', -16000),  # 16MB
             ('journal_mode', 'wal'),  # Use write-ahead-log journal mode.
         ))
+
+        # Alternatively, pragmas can be specified using a dictionary.
+        db = SqliteDatabase('my_app.db', pragmas={'journal_mode': 'wal'})
 
     .. py:method:: pragma(key[, value=SENTINEL[, permanent=False]])
 
@@ -555,7 +593,9 @@ Database
 
         Class decorator to register a user-defined aggregate function.
 
-        Example::
+        Example:
+
+        .. code-block:: python
 
             @db.aggregate('md5')
             class MD5(object):
@@ -597,7 +637,9 @@ Database
 
         Decorator to register a user-defined collation.
 
-        Example::
+        Example:
+
+        .. code-block:: python
 
             @db.collation('reverse')
             def collate_reverse(s1, s2):
@@ -634,7 +676,9 @@ Database
 
         Decorator to register a user-defined scalar function.
 
-        Example::
+        Example:
+
+        .. code-block:: python
 
             @db.func('title_case')
             def title_case(s):
@@ -642,6 +686,58 @@ Database
 
             # Usage:
             title_case_books = Book.select(fn.title_case(Book.title))
+
+    .. py:method:: register_window_function(klass[, name=None[, num_params=-1]])
+
+        :param klass: Class implementing window function API.
+        :param str name: Window function name (defaults to name of class).
+        :param int num_params: Number of parameters the function accepts, or
+            -1 for any number.
+
+        Register a user-defined window function.
+
+        .. attention::
+            This feature requires SQLite >= 3.25.0 **and**
+            `pysqlite3 <https://github.com/coleifer/pysqlite3>`_ >= 0.2.0.
+
+        The window function will be registered each time a new connection is
+        opened. Additionally, if a connection is already open, the window
+        function will be registered with the open connection.
+
+    .. py:method:: window_function([name=None[, num_params=-1]])
+
+        :param str name: Name of the window function (defaults to class name).
+        :param int num_params: Number of parameters the function accepts, or -1
+            for any number.
+
+        Class decorator to register a user-defined window function. Window
+        functions must define the following methods:
+
+        * ``step(<params>)`` - receive values from a row and update state.
+        * ``inverse(<params>)`` - inverse of ``step()`` for the given values.
+        * ``value()`` - return the current value of the window function.
+        * ``finalize()`` - return the final value of the window function.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.window_function('my_sum')
+            class MySum(object):
+                def __init__(self):
+                    self._value = 0
+
+                def step(self, value):
+                    self._value += value
+
+                def inverse(self, value):
+                    self._value -= value
+
+                def value(self):
+                    return self._value
+
+                def finalize(self):
+                    return self._value
 
     .. py:method:: table_function([name=None])
 
@@ -732,6 +828,30 @@ Database
             db = SqliteExtDatabase('my_app.db')
             db.load_extension('closure')
 
+    .. py:method:: attach(filename, name)
+
+        :param str filename: Database to attach (or ``:memory:`` for in-memory)
+        :param str name: Schema name for attached database.
+        :return: boolean indicating success
+
+        Register another database file that will be attached to every database
+        connection. If the main database is currently connected, the new
+        database will be attached on the open connection.
+
+        .. note::
+            Databases that are attached using this method will be attached
+            every time a database connection is opened.
+
+    .. py:method:: detach(name)
+
+        :param str name: Schema name for attached database.
+        :return: boolean indicating success
+
+        Unregister another database file that was attached previously with a
+        call to :py:meth:`~SqliteDatabase.attach`. If the main database is
+        currently connected, the attached database will be detached from the
+        open connection.
+
     .. py:method:: transaction([lock_type=None])
 
         :param str lock_type: Locking strategy: DEFERRED, IMMEDIATE, EXCLUSIVE.
@@ -778,12 +898,19 @@ Query-builder
         API for recursively unwrapping "wrapped" nodes. Base case is to
         return self.
 
+    .. py:method:: is_alias()
+
+        API for determining if a node, at any point, has been explicitly
+        aliased by the user.
+
 
 .. py:class:: Source([alias=None])
 
     A source of row tuples, for example a table, join, or select query. By
     default provides a "magic" attribute named "c" that is a factory for
-    column/attribute lookups, for example::
+    column/attribute lookups, for example:
+
+    .. code-block:: python
 
         User = Table('users')
         query = (User
@@ -990,14 +1117,69 @@ Query-builder
         Specify the predicate expression used for this join.
 
 
+.. py:class:: ValuesList(values[, columns=None[, alias=None]])
+
+    Represent a values list that can be used like a table.
+
+    :param values: a list-of-lists containing the row data to represent.
+    :param list columns: the names to give to the columns in each row.
+    :param str alias: alias to use for values-list.
+
+    Example:
+
+    .. code-block:: python
+
+        data = [(1, 'first'), (2, 'second')]
+        vl = ValuesList(data, columns=('idx', 'name'))
+
+        query = (vl
+                 .select(vl.c.idx, vl.c.name)
+                 .order_by(vl.c.idx))
+        # Yields:
+        # SELECT t1.idx, t1.name
+        # FROM (VALUES (1, 'first'), (2, 'second')) AS t1(idx, name)
+        # ORDER BY t1.idx
+
+    .. py:method:: columns(*names)
+
+        :param names: names to apply to the columns of data.
+
+        Example:
+
+        .. code-block:: python
+
+            vl = ValuesList([(1, 'first'), (2, 'second')])
+            vl = vl.columns('idx', 'name').alias('v')
+
+            query = vl.select(vl.c.idx, vl.c.name)
+            # Yields:
+            # SELECT v.idx, v.name
+            # FROM (VALUES (1, 'first'), (2, 'second')) AS v(idx, name)
+
+
 .. py:class:: CTE(name, query[, recursive=False[, columns=None]])
 
-    Represent a common-table-expression.
+    Represent a common-table-expression. For example queries, see :ref:`cte`.
 
     :param name: Name for the CTE.
     :param query: :py:class:`Select` query describing CTE.
     :param bool recursive: Whether the CTE is recursive.
     :param list columns: Explicit list of columns produced by CTE (optional).
+
+    .. py:method:: select_from(*columns)
+
+        Create a SELECT query that utilizes the given common table expression
+        as the source for a new query.
+
+        :param columns: One or more columns to select from the CTE.
+        :return: :py:class:`Select` query utilizing the common table expression
+
+    .. py:method:: union_all(other)
+
+        Used on the base-case CTE to construct the recursive term of the CTE.
+
+        :param other: recursive term, generally a :py:class:`Select` query.
+        :return: a recursive :py:class:`CTE` with the given recursive term.
 
 
 .. py:class:: ColumnBase()
@@ -1109,7 +1291,9 @@ Query-builder
 .. py:function:: AsIs(value)
 
     Represents a :py:class:`Value` that is treated as-is, and passed directly
-    back to the database driver.
+    back to the database driver. This may be useful if you are using database
+    extensions that accept native Python data-types and you do not wish Peewee
+    to impose any handling of the values.
 
 
 .. py:class:: Cast(node, cast)
@@ -1211,11 +1395,12 @@ Query-builder
             start of the window range.
         :param end: A :py:class:`SQL` instance or a string expressing the
             end of the window range.
+        :param str frame_type: ``Window.RANGE`` or ``Window.ROWS``.
         :param Window window: A :py:class:`Window` instance.
 
         .. note::
-            For simplicity, it is permissible to call ``over()`` with a
-            :py:class:`Window` instance as the first and only parameter.
+            For an in-depth guide to using window functions with Peewee,
+            see the :ref:`window-functions` section.
 
         Examples::
 
@@ -1242,9 +1427,18 @@ Query-builder
                      .select(Sample.value,
                              fn.SUM(Sample.value).over(
                                 partition_by=[Sample.counter],
-                                start=Window.preceding(),  # unbounded.
-                                end=Window.following(1)))  # 1 following.
+                                start=Window.CURRENT_ROW,  # current row
+                                end=Window.following()))  # unbounded following
                      .order_by(Sample.id))
+
+    .. py:method:: filter(where)
+
+        :param where: Expression for filtering aggregate.
+
+        Add a ``FILTER (WHERE...)`` clause to an aggregate function. The where
+        expression is evaluated to determine which rows are fed to the
+        aggregate function. This SQL feature is supported for Postgres and
+        SQLite.
 
     .. py:method:: coerce([coerce=True])
 
@@ -1282,7 +1476,7 @@ Query-builder
         # Get users whose username begins with "A" or "a":
         a_users = User.select().where(fn.LOWER(fn.SUBSTR(User.username, 1, 1)) == 'a')
 
-.. py:class:: Window([partition_by=None[, order_by=None[, start=None[, end=None[, alias=None]]]]])
+.. py:class:: Window([partition_by=None[, order_by=None[, start=None[, end=None[, frame_type=None[, alias=None]]]]]])
 
     :param list partition_by: List of columns to partition by.
     :param list order_by: List of columns to order by.
@@ -1290,17 +1484,35 @@ Query-builder
         of the window range.
     :param end: A :py:class:`SQL` instance or a string expressing the end of
         the window range.
+    :param str frame_type: ``Window.RANGE`` or ``Window.ROWS``.
     :param str alias: Alias for the window.
 
     Represent a WINDOW clause.
 
+    .. note::
+        For an in-depth guide to using window functions with Peewee,
+        see the :ref:`window-functions` section.
+
     .. py:attribute:: CURRENT_ROW
 
-        Handy reference to current row for use in start/end clause.
+        Reference to current row for use in start/end clause.
 
-    .. py:method:: alias([alias=None])
+    .. py:attribute:: RANGE
 
-        :param str alias: Alias to use for window.
+        Specify the use of *RANGE* for the window ``frame_type``. For more
+        information, see :ref:`window-frame-types`.
+
+    .. py:attribute:: ROWS
+
+        Specify the use of *ROWS* for the window ``frame_type``. For more
+        information, see :ref:`window-frame-types`.
+
+    .. py:staticmethod:: preceding([value=None])
+
+        :param value: Number of rows preceding. If ``None`` is UNBOUNDED.
+
+        Convenience method for generating SQL suitable for passing in as the
+        ``start`` parameter for a window range.
 
     .. py:staticmethod:: following([value=None])
 
@@ -1309,12 +1521,9 @@ Query-builder
         Convenience method for generating SQL suitable for passing in as the
         ``end`` parameter for a window range.
 
-    .. py:staticmethod:: preceding([value=None])
+    .. py:method:: alias([alias=None])
 
-        :param value: Number of rows preceding. If ``None`` is UNBOUNDED.
-
-        Convenience method for generating SQL suitable for passing in as the
-        ``start`` parameter for a window range.
+        :param str alias: Alias to use for window.
 
 
 .. py:function:: Case(predicate, expression_tuples[, default=None]])
@@ -1402,7 +1611,7 @@ Query-builder
 
     :param str action: Action to take when resolving conflict.
     :param update: A dictionary mapping column to new value.
-    :param preserve: A list of columns whose values should be preserved.
+    :param preserve: A list of columns whose values should be preserved from the original INSERT.
     :param where: Expression to restrict the conflict resolution.
     :param conflict_target: Name of column or constraint to check.
 
@@ -1551,10 +1760,11 @@ Query-builder
 
     .. py:method:: with_cte(*cte_list)
 
-        :param cte_list: zero or more CTE objects.
+        :param cte_list: zero or more :py:class:`CTE` objects.
 
-        Include the given common-table-expressions in the query. Any previously
-        specified CTEs will be overwritten.
+        Include the given common-table expressions in the query. Any previously
+        specified CTEs will be overwritten. For examples of common-table
+        expressions, see :ref:`cte`.
 
     .. py:method:: where(*expressions)
 
@@ -1624,23 +1834,88 @@ Query-builder
         Convenience method for specifying the LIMIT and OFFSET in a more
         intuitive way.
 
+        This feature is designed with web-site pagination in mind, so the first
+        page starts with ``page=1``.
+
 
 .. py:class:: SelectQuery()
 
     Select query helper-class that implements operator-overloads for creating
     compound queries.
 
+    .. py:method:: cte(name[, recursive=False[, columns=None]])
+
+        :param str name: Alias for common table expression.
+        :param bool recursive: Will this be a recursive CTE?
+        :param list columns: List of column names (as strings).
+
+        Indicate that a query will be used as a common table expression. For
+        example, if we are modelling a category tree and are using a
+        parent-link foreign key, we can retrieve all categories and their
+        absolute depths using a recursive CTE:
+
+        .. code-block:: python
+
+            class Category(Model):
+                name = TextField()
+                parent = ForeignKeyField('self', backref='children', null=True)
+
+            # The base case of our recursive CTE will be categories that are at
+            # the root level -- in other words, categories without parents.
+            roots = (Category
+                     .select(Category.name, Value(0).alias('level'))
+                     .where(Category.parent.is_null())
+                     .cte(name='roots', recursive=True))
+
+            # The recursive term will select the category name and increment
+            # the depth, joining on the base term so that the recursive term
+            # consists of all children of the base category.
+            RTerm = Category.alias()
+            recursive = (RTerm
+                         .select(RTerm.name, (roots.c.level + 1).alias('level'))
+                         .join(roots, on=(RTerm.parent == roots.c.id)))
+
+            # Express <base term> UNION ALL <recursive term>.
+            cte = roots.union_all(recursive)
+
+            # Select name and level from the recursive CTE.
+            query = (cte
+                     .select_from(cte.c.name, cte.c.level)
+                     .order_by(cte.c.name))
+
+            for category in query:
+                print(category.name, category.level)
+
+        For more examples of CTEs, see :ref:`cte`.
+
+    .. py:method:: union_all(dest)
+
+        Create a UNION ALL query with ``dest``.
+
     .. py:method:: __add__(dest)
 
         Create a UNION ALL query with ``dest``.
+
+    .. py:method:: union(dest)
+
+        Create a UNION query with ``dest``.
 
     .. py:method:: __or__(dest)
 
         Create a UNION query with ``dest``.
 
+    .. py:method:: intersect(dest)
+
+        Create an INTERSECT query with ``dest``.
+
     .. py:method:: __and__(dest)
 
         Create an INTERSECT query with ``dest``.
+
+    .. py:method:: except_(dest)
+
+        Create an EXCEPT query with ``dest``. Note that the method name has a
+        trailing "_" character since ``except`` is a Python reserved word.
 
     .. py:method:: __sub__(dest)
 
@@ -1974,10 +2249,42 @@ Query-builder
 
         Specify REPLACE conflict resolution strategy.
 
-    .. py:method:: on_conflict(*args, **kwargs)
+    .. py:method:: on_conflict([action=None[, update=None[, preserve=None[, where=None[, conflict_target=None]]]]])
 
-        Specify an ON CONFLICT clause by populating a :py:class:`OnConflict`
-        object.
+        :param str action: Action to take when resolving conflict. If blank,
+            action is assumed to be "update".
+        :param update: A dictionary mapping column to new value.
+        :param preserve: A list of columns whose values should be preserved from the original INSERT.
+        :param where: Expression to restrict the conflict resolution.
+        :param conflict_target: Name of column or constraint to check.
+
+        Specify the parameters for an :py:class:`OnConflict` clause to use for
+        conflict resolution.
+
+        Example:
+
+        .. code-block:: python
+
+            class User(Model):
+                username = TextField(unique=True)
+                last_login = DateTimeField(null=True)
+                login_count = IntegerField()
+
+            def log_user_in(username):
+                now = datetime.datetime.now()
+
+                # INSERT a new row for the user with the current timestamp and
+                # login count set to 1. If the user already exists, then we
+                # will preserve the last_login value from the "insert()" clause
+                # and atomically increment the login-count.
+                userid = (User
+                          .insert(username=username, last_login=now, login_count=1)
+                          .on_conflict(
+                              conflict_target=[User.username],
+                              preserve=[User.last_login],
+                              update={User.login_count: User.login_count + 1})
+                          .execute())
+                return userid
 
 
 .. py:class:: Delete()
@@ -2067,6 +2374,8 @@ Query-builder
         # index will be created.
         Article.add_index(idx)
 
+.. _fields-api:
+
 Fields
 ------
 
@@ -2089,7 +2398,7 @@ Fields
     :param str help_text: Help-text for field, metadata purposes only.
     :param str verbose_name: Verbose name for field, metadata purposes only.
 
-    Fields on a :py:class:`Model` are analagous to columns on a table.
+    Fields on a :py:class:`Model` are analogous to columns on a table.
 
     .. py:attribute:: field_type = '<some field type>'
 
@@ -2158,6 +2467,19 @@ Fields
 .. py:class:: BigAutoField
 
     Field class for storing auto-incrementing primary keys using 64-bits.
+
+.. py:class:: IdentityField
+
+    Field class for storing auto-incrementing primary keys using the new
+    Postgres 10 *IDENTITY* column type. The column definition ends up looking
+    like this:
+
+    .. code-block:: python
+
+        id = IdentityField()
+        # "id" INT GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY
+
+    .. attention:: Only supported by Postgres 10.0 and newer.
 
 .. py:class:: FloatField
 
@@ -2236,11 +2558,17 @@ Fields
         # Query for sticky + favorite posts:
         query = Post.select().where(Post.is_sticky & Post.is_favorite)
 
-    .. py:method:: flag(value)
+    .. py:method:: flag([value=None])
+
+        :param int value: Value associated with flag, typically a power of 2.
 
         Returns a descriptor that can get or set specific bits in the overall
         value. When accessed on the class itself, it returns a
         :py:class:`Expression` object suitable for use in a query.
+
+        If the value is not provided, it is assumed that each flag will be an
+        increasing power of 2, so if you had four flags, they would have the
+        values 1, 2, 4, 8.
 
 .. py:class:: BigBitField
 
@@ -2315,7 +2643,15 @@ Fields
 
 .. py:class:: UUIDField
 
-    Field class for storing ``uuid.UUID`` objects.
+    Field class for storing ``uuid.UUID`` objects. With Postgres, the
+    underlying column's data-type will be *UUID*. Since SQLite and MySQL do not
+    have a native UUID type, the UUID is stored as a *VARCHAR* instead.
+
+.. py:class:: BinaryUUIDField
+
+    Field class for storing ``uuid.UUID`` objects efficiently in 16-bytes. Uses
+    the database's *BLOB* data-type (or *VARBINARY* in MySQL, or *BYTEA* in
+    Postgres).
 
 .. py:class:: DateTimeField([formats=None[, **kwargs]])
 
@@ -2328,14 +2664,17 @@ Fields
     the datetime can be encoded with (for databases that do not have support
     for a native datetime data-type). The default supported formats are:
 
-    .. note::
-        If the incoming value does not match a format, it is returned as-is.
-
     .. code-block:: python
 
         '%Y-%m-%d %H:%M:%S.%f' # year-month-day hour-minute-second.microsecond
         '%Y-%m-%d %H:%M:%S' # year-month-day hour-minute-second
         '%Y-%m-%d' # year-month-day
+
+    .. note::
+        SQLite does not have a native datetime data-type, so datetimes are
+        stored as strings. This is handled transparently by Peewee, but if you
+        have pre-existing data you should ensure it is stored as
+        ``YYYY-mm-dd HH:MM:SS`` or one of the other supported formats.
 
     .. py:attribute:: year
 
@@ -2480,7 +2819,7 @@ Fields
     Accepts a special ``coerce`` parameter, a function that takes a value
     coming from the database and converts it into the appropriate Python type.
 
-.. py:class:: ForeignKeyField(model[, field=None[, backref=None[, on_delete=None[, on_update=None[, object_id_name=None[, **kwargs]]]]]])
+.. py:class:: ForeignKeyField(model[, field=None[, backref=None[, on_delete=None[, on_update=None[, deferrable=None[, object_id_name=None[, **kwargs]]]]]]])
 
     :param Model model: Model to reference or the string 'self' if declaring a
         self-referential foreign key.
@@ -2489,6 +2828,7 @@ Fields
     :param str backref: Accessor name for back-reference.
     :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``..
     :param str on_update: ON UPDATE action.
+    :param str deferrable: Control when constraint is enforced, e.g. ``'INITIALLY DEFERRED'``.
     :param str object_id_name: Name for object-id accessor.
 
     Field class for storing a foreign key.
@@ -2513,6 +2853,9 @@ Fields
         Another tweet
         Yet another tweet
 
+    For an in-depth discussion of foreign-keys, joins and relationships between
+    models, refer to :ref:`relationships`.
+
     .. note::
         Foreign keys do not have a particular ``field_type`` as they will take
         their field type depending on the type of primary key on the model they
@@ -2526,17 +2869,32 @@ Fields
         Take care with foreign keys in SQLite. By default, ON DELETE has no
         effect, which can have surprising (and usually unwanted) effects on
         your database integrity. This can affect you even if you don't specify
-        on_delete, since the default ON DELETE behaviour (to fail without
+        ``on_delete``, since the default ON DELETE behaviour (to fail without
         modifying your data) does not happen, and your data can be silently
         relinked. The safest thing to do is to specify
-        ``pragmas=(('foreign_keys', 'on'),)`` when you instantiate
+        ``pragmas={'foreign_keys': 1}`` when you instantiate
         :py:class:`SqliteDatabase`.
 
 .. py:class:: DeferredForeignKey(rel_model_name[, **kwargs])
 
     :param str rel_model_name: Model name to reference.
 
-    Field class for representing a deferred foreign key.
+    Field class for representing a deferred foreign key. Useful for circular
+    foreign-key references, for example:
+
+    .. code-block:: python
+
+        class Husband(Model):
+            name = TextField()
+            wife = DeferredForeignKey('Wife', deferrable='INITIALLY DEFERRED')
+
+        class Wife(Model):
+            name = TextField()
+            husband = ForeignKeyField(Husband, deferrable='INITIALLY DEFERRED')
+
+    In the above example, when the ``Wife`` model is declared, the foreign-key
+    ``Husband.wife`` is automatically resolved and turned into a regular
+    :py:class:`ForeignKeyField`.
 
 .. py:class:: ManyToManyField(model[, backref=None[, through_model=None]])
 
@@ -3017,17 +3375,13 @@ Model
 
         Example:
 
-        .. code-block:: pycon
+        .. code-block:: python
 
             Parent = Category.alias()
             sq = (Category
                   .select(Category, Parent)
                   .join(Parent, on=(Category.parent == Parent.id))
                   .where(Parent.name == 'parent category'))
-
-        .. note::
-            When using a :py:class:`ModelAlias` in a join, you must explicitly
-            specify the join condition.
 
     .. py:classmethod:: select(*fields)
 
@@ -3269,7 +3623,7 @@ Model
 
             q = User.raw('select id, username from users')
             for user in q:
-                print user.id, user.username
+                print(user.id, user.username)
 
         .. note::
             Generally the use of ``raw`` is reserved for those cases where you
@@ -3386,7 +3740,8 @@ Model
 
         :param kwargs: Mapping of field-name to value.
         :param defaults: Default values to use if creating a new row.
-        :returns: :py:class:`Model` instance.
+        :returns: Tuple of :py:class:`Model` instance and boolean indicating
+            if a new object was created.
 
         Attempt to get the row matching the given filters. If no matching row
         is found, create a new row.
@@ -3693,12 +4048,17 @@ Model
         :py:meth:`~ModelSelect.join` will be joined against. Used for
         specifying multiple joins against a single table.
 
+        If the ``ctx`` is not given, then the query's model will be used.
+
         The following example selects from tweet and joins on both user and
         tweet-flag:
 
         .. code-block:: python
 
             sq = Tweet.select().join(User).switch(Tweet).join(TweetFlag)
+
+            # Equivalent (since Tweet is the query's model)
+            sq = Tweet.select().join(User).switch().join(TweetFlag)
 
     .. py:method:: objects([constructor=None])
 
@@ -3753,6 +4113,9 @@ Model
         .. code-block:: python
 
             sq = User.select().join(Relationship, on=Relationship.to_user)
+
+        For an in-depth discussion of foreign-keys, joins and relationships
+        between models, refer to :ref:`relationships`.
 
     .. py:method:: join_from(src, dest[, join_type='INNER'[, on=None[, attr=None]]])
 

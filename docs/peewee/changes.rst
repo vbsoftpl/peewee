@@ -24,6 +24,8 @@ Database
   well as :py:meth:`Model.create_table` and :py:meth:`Model.drop_table` all
   default to ``safe=True`` (``create_table`` will create if not exists, ``drop_table`` will drop if exists).
 * ``connect_kwargs`` attribute has been renamed to ``connect_params``
+* initialization parameter for custom field-type definitions has changed
+  from ``fields`` to ``field_types``.
 
 Model Meta options
 ^^^^^^^^^^^^^^^^^^
@@ -54,7 +56,7 @@ Fields
   * ``rel_model`` has changed to ``model``
   * ``to_field`` has changed to ``field``
   * ``related_name`` has changed to ``backref``
-  
+
 * :py:class:`ManyToManyField` is now included in the main ``peewee.py`` module
 * Removed the extension fields ``PasswordField``, ``PickledField`` and
   ``AESEncryptedField``.
@@ -82,9 +84,15 @@ into the main peewee module.
 The :py:meth:`~BaseColumn.cast` method is no longer a function, but instead is
 a method on all column-like objects.
 
+The ``InsertQuery.return_id_list()`` method has been replaced by a more general
+pattern of using :py:meth:`_WriteQuery.returning`.
+
 When using :py:func:`prefetch`, the collected instances will be stored in the
 same attribute as the foreign-key's ``backref``. Previously, you would access
 joined instances using ``(backref)_prefetch``.
+
+The :py:class:`SQL` object, used to create a composable a SQL string, now
+expects the second parameter to be a list/tuple of parameters.
 
 Removed Extensions
 ^^^^^^^^^^^^^^^^^^
@@ -123,6 +131,13 @@ like this:
        field definitions,
        arguments,
        options)
+
+Postgresql Extension
+^^^^^^^^^^^^^^^^^^^^
+
+The `PostgresqlExtDatabase` no longer registers the `hstore` extension by
+default. To use the `hstore` extension in 3.0 and onwards, pass
+`register_hstore=True` when initializing the database object.
 
 Signals Extension
 ^^^^^^^^^^^^^^^^^

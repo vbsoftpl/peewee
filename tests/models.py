@@ -4,20 +4,29 @@ import time
 import unittest
 
 from peewee import *
-from peewee import sqlite3
+from peewee import NodeList
+from peewee import QualifiedNames
+from peewee import sort_models
 
 from .base import db
 from .base import get_in_memory_db
 from .base import mock
 from .base import new_connection
 from .base import requires_models
-from .base import skip_case_unless
+from .base import requires_mysql
+from .base import requires_postgresql
 from .base import skip_if
 from .base import skip_unless
 from .base import BaseTestCase
 from .base import IS_MYSQL
+from .base import IS_MYSQL_ADVANCED_FEATURES
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
+from .base import IS_SQLITE_OLD
+from .base import IS_SQLITE_15  # Row-values.
+from .base import IS_SQLITE_24  # Upsert.
+from .base import IS_SQLITE_25  # Window functions.
+from .base import IS_SQLITE_9
 from .base import ModelTestCase
 from .base import TestModel
 from .base_models import *
@@ -48,9 +57,6 @@ class Point(TestModel):
     y = IntegerField()
     class Meta:
         primary_key = False
-
-
-IS_OLD_SQLITE = IS_SQLITE and sqlite3.sqlite_version_info < (3, 18)
 
 
 class TestModelAPIs(ModelTestCase):
@@ -577,7 +583,7 @@ class TestModelAPIs(ModelTestCase):
             data = [(user.username, user.tweet.content) for user in query]
 
         # Failing on travis-ci...old SQLite?
-        if not IS_OLD_SQLITE:
+        if not IS_SQLITE_OLD:
             self.assertEqual(data, [
                 ('huey', 'hiss'),
                 ('mickey', 'grr')])
@@ -602,13 +608,14 @@ class TestModelAPIs(ModelTestCase):
                  .select(User.id, User.username)
                  .where(User.username.in_(['huey', 'zaizee'])))
         query = (Tweet
-                 .select(Tweet.content, users.c.username)
+                 .select(Tweet.content.alias('content'),
+                         users.c.username.alias('username'))
                  .join(users, on=(Tweet.user == users.c.id))
                  .order_by(Tweet.id))
 
         self.assertSQL(query, (
-            'SELECT "t1"."content", "t2"."username" '
-            'FROM "tweet" AS "t1" '
+            'SELECT "t1"."content" AS "content", "t2"."username" AS "username"'
+            ' FROM "tweet" AS "t1" '
             'INNER JOIN (SELECT "t3"."id", "t3"."username" '
             'FROM "users" AS "t3" '
             'WHERE ("t3"."username" IN (?, ?))) AS "t2" '
@@ -616,19 +623,13 @@ class TestModelAPIs(ModelTestCase):
             'ORDER BY "t1"."id"'), ['huey', 'zaizee'])
         with self.assertQueryCount(1):
             results = [(t.content, t.user.username) for t in query]
-            if IS_OLD_SQLITE:
-                self.assertEqual(results, [
-                    ('meow', None),
-                    ('purr', None),
-                    ('hiss', None)])
-            else:
-                self.assertEqual(results, [
-                    ('meow', 'huey'),
-                    ('purr', 'huey'),
-                    ('hiss', 'huey')])
+            self.assertEqual(results, [
+                ('meow', 'huey'),
+                ('purr', 'huey'),
+                ('hiss', 'huey')])
 
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
     @requires_models(User, Tweet)
-    @skip_if(IS_MYSQL or IS_OLD_SQLITE)
     def test_join_subquery_cte(self):
         self._create_user_tweets()
 
@@ -654,6 +655,53 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual([t.content for t in query],
                              ['meow', 'purr', 'hiss'])
 
+    @skip_if(IS_MYSQL)  # MariaDB does not support LIMIT in subqueries!
+    @requires_models(User)
+    def test_subquery_emulate_window(self):
+        # We have duplicated users. Select a maximum of 2 instances of the
+        # username.
+        name2count = {
+            'beanie': 6,
+            'huey': 5,
+            'mickey': 3,
+            'pipey': 1,
+            'zaizee': 4}
+        names = []
+        for name, count in sorted(name2count.items()):
+            names += [name] * count
+        User.insert_many([(n,) for n in names], [User.username]).execute()
+
+        # The results we are trying to obtain.
+        expected = [
+            ('beanie', 1), ('beanie', 2),
+            ('huey', 7), ('huey', 8),
+            ('mickey', 12), ('mickey', 13),
+            ('pipey', 15),
+            ('zaizee', 16), ('zaizee', 17)]
+
+        # Using a self-join.
+        UA = User.alias()
+        query = (User
+                 .select(User.username, UA.id)
+                 .join(UA, on=((UA.username == User.username) &
+                               (UA.id >= User.id)))
+                 .group_by(User.username, UA.id)
+                 .having(fn.COUNT(UA.id) < 3)
+                 .order_by(User.username, UA.id))
+        self.assertEqual(query.tuples()[:], expected)
+
+        # Using a correlated subquery.
+        subq = (UA
+                .select(UA.id)
+                .where(User.username == UA.username)
+                .order_by(UA.id)
+                .limit(2))
+        query = (User
+                 .select(User.username, User.id)
+                 .where(User.id.in_(subq.alias('subq')))
+                 .order_by(User.username, User.id))
+        self.assertEqual(query.tuples()[:], expected)
+
     @requires_models(User, Tweet)
     def test_insert_query_value(self):
         huey = self.add_user('huey')
@@ -663,8 +711,8 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(tweet.user.id, huey.id)
         self.assertEqual(tweet.user.username, 'huey')
 
+    @skip_if(IS_SQLITE and not IS_SQLITE_9, 'requires sqlite >= 3.9')
     @requires_models(Register)
-    @skip_if(IS_SQLITE and sqlite3.sqlite_version_info < (3, 9))
     def test_compound_select(self):
         for i in range(10):
             Register.create(value=i)
@@ -696,6 +744,107 @@ class TestModelAPIs(ModelTestCase):
 
         self.assertEqual([row.value for row in c2], [0, 1, 5, 8, 9])
         self.assertEqual(c2.count(), 5)
+
+    @requires_models(User, Tweet)
+    def test_union_column_resolution(self):
+        u1 = User.create(username='u1')
+        u2 = User.create(username='u2')
+        q1 = User.select().where(User.id == 1)
+        q2 = User.select()
+        union = q1 | q2
+        self.assertSQL(union, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."id" = ?) '
+            'UNION '
+            'SELECT "t2"."id", "t2"."username" FROM "users" AS "t2"'), [1])
+
+        results = [(user.id, user.username) for user in union]
+        self.assertEqual(sorted(results), [
+            (1, 'u1'),
+            (2, 'u2')])
+
+        t1_1 = Tweet.create(user=u1, content='u1-t1')
+        t1_2 = Tweet.create(user=u1, content='u1-t2')
+        t2_1 = Tweet.create(user=u2, content='u2-t1')
+        q1 = Tweet.select(Tweet, User).join(User).where(User.id == 1)
+        q2 = Tweet.select(Tweet, User).join(User)
+        union = q1 | q2
+        self.assertSQL(union, (
+            'SELECT "t1"."id", "t1"."user_id", "t1"."content", '
+            '"t1"."timestamp", "t2"."id", "t2"."username" '
+            'FROM "tweet" AS "t1" '
+            'INNER JOIN "users" AS "t2" ON ("t1"."user_id" = "t2"."id") '
+            'WHERE ("t2"."id" = ?) '
+            'UNION '
+            'SELECT "t3"."id", "t3"."user_id", "t3"."content", '
+            '"t3"."timestamp", "t4"."id", "t4"."username" '
+            'FROM "tweet" AS "t3" '
+            'INNER JOIN "users" AS "t4" ON ("t3"."user_id" = "t4"."id")'), [1])
+
+        with self.assertQueryCount(1):
+            results = [(t.id, t.content, t.user.username) for t in union]
+            self.assertEqual(sorted(results), [
+                (1, 'u1-t1', 'u1'),
+                (2, 'u1-t2', 'u1'),
+                (3, 'u2-t1', 'u2')])
+
+        union_flat = (q1 | q2).objects()
+        with self.assertQueryCount(1):
+            results = [(t.id, t.content, t.username) for t in union_flat]
+            self.assertEqual(sorted(results), [
+                (1, 'u1-t1', 'u1'),
+                (2, 'u1-t2', 'u1'),
+                (3, 'u2-t1', 'u2')])
+
+    @requires_models(User, Tweet)
+    def test_union_with_join(self):
+        u1, u2 = [User.create(username='u%s' % i) for i in (1, 2)]
+        for u, ts in ((u1, ('t1', 't2')), (u2, ('t1',))):
+            for t in ts:
+                Tweet.create(user=u, content='%s-%s' % (u.username, t))
+
+        q1 = (User
+              .select(User, Tweet)
+              .join(Tweet, on=(Tweet.user == User.id).alias('foo')))
+        q2 = (User
+              .select(User, Tweet)
+              .join(Tweet, on=(Tweet.user == User.id).alias('foo')))
+
+        with self.assertQueryCount(1):
+            self.assertEqual(
+                sorted([(user.username, user.foo.content) for user in q1]),
+                [('u1', 'u1-t1'), ('u1', 'u1-t2'), ('u2', 'u2-t1')])
+
+        uq = q1.union_all(q2)
+        with self.assertQueryCount(1):
+            result = [(user.username, user.foo.content) for user in uq]
+            self.assertEqual(sorted(result), [
+                ('u1', 'u1-t1'),
+                ('u1', 'u1-t1'),
+                ('u1', 'u1-t2'),
+                ('u1', 'u1-t2'),
+                ('u2', 'u2-t1'),
+                ('u2', 'u2-t1'),
+            ])
+
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    @requires_models(User)
+    def test_union_cte(self):
+        with self.database.atomic():
+            (User
+             .insert_many({'username': 'u%s' % i} for i in range(10))
+             .execute())
+
+        lhs = User.select().where(User.username.in_(['u1', 'u3']))
+        rhs = User.select().where(User.username.in_(['u5', 'u7']))
+        u_cte = (lhs | rhs).cte('users_union')
+
+        query = (User
+                 .select(User.username)
+                 .join(u_cte, on=(User.id == u_cte.c.id))
+                 .where(User.username.in_(['u1', 'u7']))
+                 .with_cte(u_cte))
+        self.assertEqual(sorted([u.username for u in query]), ['u1', 'u7'])
 
     @requires_models(Category)
     def test_self_referential_fk(self):
@@ -787,6 +936,14 @@ class TestModelAPIs(ModelTestCase):
         self.assertSQL(f.notes, (
             'SELECT "t1"."id", "t1"."foo_id" FROM "note" AS "t1" '
             'WHERE ("t1"."foo_id" = ?)'), [1337])
+
+    def test_deferred_fk_dependency_graph(self):
+        class AUser(TestModel):
+            foo = DeferredForeignKey('Tweet')
+        class ZTweet(TestModel):
+            user = ForeignKeyField(AUser, backref='ztweets')
+
+        self.assertEqual(sort_models([AUser, ZTweet]), [AUser, ZTweet])
 
     def test_table_schema(self):
         class Schema(TestModel):
@@ -917,21 +1074,57 @@ class TestDeleteInstance(ModelTestCase):
 
     def test_delete_instance_recursive(self):
         huey = User.get(User.username == 'huey')
-        huey.delete_instance(recursive=True)
+        with self.assertQueryCount(5):
+            huey.delete_instance(recursive=True)
+
+        queries = [logrecord.msg for logrecord in self._qh.queries[-5:]]
+        self.assertEqual(sorted(queries), [
+            ('DELETE FROM "favorite" WHERE ('
+             '"tweet_id" IN (SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
+             '"t1"."user_id" = ?)))', [huey.id]),
+            ('DELETE FROM "favorite" WHERE ("user_id" = ?)', [huey.id]),
+            ('DELETE FROM "tweet" WHERE ("user_id" = ?)', [huey.id]),
+            ('DELETE FROM "users" WHERE ("id" = ?)', [huey.id]),
+            ('UPDATE "account" SET "user_id" = ? WHERE ("user_id" = ?)',
+             [None, huey.id]),
+        ])
+
+        # Only one user left.
         self.assertEqual(User.select().count(), 1)
 
+        # Huey's account has had the FK cleared out.
         acct = Account.get(Account.email == 'huey@meow.com')
         self.assertTrue(acct.user is None)
 
+        # Huey owned a favorite and one of huey's tweets was the other fav.
         self.assertEqual(Favorite.select().count(), 0)
 
+        # The only tweet left is mickey's.
         self.assertEqual(Tweet.select().count(), 1)
         tweet = Tweet.get()
         self.assertEqual(tweet.content, 'woof')
 
     def test_delete_nullable(self):
         huey = User.get(User.username == 'huey')
-        huey.delete_instance(recursive=True, delete_nullable=True)
+        # Favorite -> Tweet -> User (other users' favorites of huey's tweets)
+        # Favorite -> User (huey's favorite tweets)
+        # Account -> User (huey's account)
+        # User ... for a total of 5. Favorite x2, Tweet, Account, User.
+        with self.assertQueryCount(5):
+            huey.delete_instance(recursive=True, delete_nullable=True)
+
+        # Get the last 5 delete queries.
+        queries = [logrecord.msg for logrecord in self._qh.queries[-5:]]
+        self.assertEqual(sorted(queries), [
+            ('DELETE FROM "account" WHERE ("user_id" = ?)', [huey.id]),
+            ('DELETE FROM "favorite" WHERE ('
+             '"tweet_id" IN (SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
+             '"t1"."user_id" = ?)))', [huey.id]),
+            ('DELETE FROM "favorite" WHERE ("user_id" = ?)', [huey.id]),
+            ('DELETE FROM "tweet" WHERE ("user_id" = ?)', [huey.id]),
+            ('DELETE FROM "users" WHERE ("id" = ?)', [huey.id]),
+        ])
+
         self.assertEqual(User.select().count(), 1)
         self.assertEqual(Account.select().count(), 0)
         self.assertEqual(Favorite.select().count(), 0)
@@ -996,12 +1189,15 @@ class TestDefaultValues(ModelTestCase):
     database = get_in_memory_db()
     requires = [Sample, SampleMeta]
 
-    def test_default_absent_on_insert(self):
+    def test_default_present_on_insert(self):
+        # Although value is not specified, it has a default, which is included
+        # in the INSERT.
         query = Sample.insert(counter=0)
         self.assertSQL(query, (
             'INSERT INTO "sample" ("counter", "value") '
             'VALUES (?, ?)'), [0, 1.0])
 
+        # Default values are also included when doing bulk inserts.
         query = Sample.insert_many([
             {'counter': '0'},
             {'counter': 1, 'value': 2},
@@ -1016,7 +1212,6 @@ class TestDefaultValues(ModelTestCase):
             'INSERT INTO "sample" ("counter", "value") '
             'VALUES (?, ?), (?, ?)'), [0, 1.0, 1, 2.0])
 
-
     def test_default_present_on_create(self):
         s = Sample.create(counter=3)
         s_db = Sample.get(Sample.counter == 3)
@@ -1030,6 +1225,7 @@ class TestDefaultValues(ModelTestCase):
         # Simple query.
         query = SampleMeta.select(SampleMeta.sample).order_by(SampleMeta.value)
 
+        # Defaults are not present when doing a read query.
         with self.assertQueryCount(1):
             sm1_db, sm2_db = list(query)
             self.assertIsNone(sm1_db.value)
@@ -1114,6 +1310,25 @@ class TestJoinModelAlias(ModelTestCase):
     def test_control(self):
         self.assertTweets(self._test_query(lambda: User).join(User))
 
+    def test_join_aliased_columns(self):
+        query = (Tweet
+                 .select(Tweet.id.alias('tweet_id'), Tweet.content)
+                 .order_by(Tweet.id))
+        self.assertEqual([(t.tweet_id, t.content) for t in query], [
+            (1, 'meow'),
+            (2, 'purr'),
+            (3, 'hiss'),
+            (4, 'woof')])
+
+        query = (Tweet
+                 .select(Tweet.id.alias('tweet_id'), Tweet.content)
+                 .join(User)
+                 .where(User.username == 'huey')
+                 .order_by(Tweet.id))
+        self.assertEqual([(t.tweet_id, t.content) for t in query], [
+            (1, 'meow'),
+            (2, 'purr')])
+
     def test_join(self):
         UA = User.alias('ua')
         query = self._test_query(lambda: UA).join(UA)
@@ -1121,8 +1336,7 @@ class TestJoinModelAlias(ModelTestCase):
 
     def test_join_on(self):
         UA = User.alias('ua')
-        query = self._test_query(lambda: UA)
-        query = query.join(UA, on=(Tweet.user == UA.id))
+        query = self._test_query(lambda: UA).join(UA, on=(Tweet.user == UA.id))
         self.assertTweets(query)
 
     def test_join_on_field(self):
@@ -1141,6 +1355,12 @@ class TestJoinModelAlias(ModelTestCase):
         UA = User.alias('ua')
         query = self._test_query(lambda: UA).join(UA, attr='baz')
         self.assertTweets(query, 'baz')
+
+    def test_join_on_alias_attr(self):
+        UA = User.alias('ua')
+        q = self._test_query(lambda: UA)
+        q = q.join(UA, on=(Tweet.user == UA.id).alias('foo'), attr='bar')
+        self.assertTweets(q, 'bar')
 
     def _test_query_backref(self, alias_expr):
         TA = alias_expr()
@@ -1226,7 +1446,8 @@ class TestJoinModelAlias(ModelTestCase):
                 self.assertEqual(data, [('meow', 'huey'), ('purr', 'huey')])
 
 
-@skip_case_unless(isinstance(db, PostgresqlDatabase))
+@skip_unless(IS_POSTGRESQL or IS_MYSQL_ADVANCED_FEATURES or IS_SQLITE_25,
+             'window function')
 class TestWindowFunctionIntegration(ModelTestCase):
     requires = [Sample]
 
@@ -1242,7 +1463,7 @@ class TestWindowFunctionIntegration(ModelTestCase):
                  .select(Sample.counter, Sample.value,
                          fn.AVG(Sample.value).over(
                              partition_by=[Sample.counter]))
-                 .order_by(Sample.counter)
+                 .order_by(Sample.counter, Sample.value)
                  .tuples())
         expected = [
             (1, 10., 15.),
@@ -1257,9 +1478,58 @@ class TestWindowFunctionIntegration(ModelTestCase):
                  .select(Sample.counter, Sample.value,
                          fn.AVG(Sample.value).over(window))
                  .window(window)
-                 .order_by(Sample.counter)
+                 .order_by(Sample.counter, Sample.value)
                  .tuples())
         self.assertEqual(list(query), expected)
+
+    def test_mixed_ordering(self):
+        s = fn.SUM(Sample.value).over(order_by=[Sample.value])
+        query = (Sample
+                 .select(Sample.counter, Sample.value, s.alias('rtotal'))
+                 .order_by(Sample.id))
+        # We end up with window going 1., 3., 10., 20., 100..
+        # So:
+        # 1 |  10 | (1 + 3 + 10)
+        # 1 |  20 | (1 + 3 + 10  + 20)
+        # 2 |   1 | (1)
+        # 2 |   3 | (1 + 3)
+        # 3 | 100 | (1 + 3 + 10 + 20 + 100)
+        self.assertEqual([(r.counter, r.value, r.rtotal) for r in query], [
+            (1, 10., 14.),
+            (1, 20., 34.),
+            (2, 1., 1.),
+            (2, 3., 4.),
+            (3, 100., 134.)])
+
+    def test_reuse_window(self):
+        w = Window(order_by=[Sample.value])
+        with self.database.atomic():
+            Sample.delete().execute()
+            for i in range(10):
+                Sample.create(counter=i, value=10 * i)
+
+        query = (Sample
+                 .select(Sample.counter, Sample.value,
+                         fn.NTILE(4).over(w).alias('quartile'),
+                         fn.NTILE(5).over(w).alias('quintile'),
+                         fn.NTILE(100).over(w).alias('percentile'))
+                 .window(w)
+                 .order_by(Sample.id))
+        results = [(r.counter, r.value, r.quartile, r.quintile, r.percentile)
+                   for r in query]
+        self.assertEqual(results, [
+            # ct, v, 4tile, 5tile, 100tile
+            (0, 0., 1, 1, 1),
+            (1, 10., 1, 1, 2),
+            (2, 20., 1, 2, 3),
+            (3, 30., 2, 2, 4),
+            (4, 40., 2, 3, 5),
+            (5, 50., 2, 3, 6),
+            (6, 60., 3, 4, 7),
+            (7, 70., 3, 4, 8),
+            (8, 80., 4, 5, 9),
+            (9, 90., 4, 5, 10),
+        ])
 
     def test_ordered_window(self):
         window = Window(partition_by=[Sample.counter],
@@ -1268,7 +1538,7 @@ class TestWindowFunctionIntegration(ModelTestCase):
                  .select(Sample.counter, Sample.value,
                          fn.RANK().over(window=window).alias('rank'))
                  .window(window)
-                 .order_by(Sample.counter, SQL('rank'))
+                 .order_by(Sample.counter, fn.RANK().over(window=window))
                  .tuples())
         self.assertEqual(list(query), [
             (1, 20., 1),
@@ -1337,8 +1607,74 @@ class TestWindowFunctionIntegration(ModelTestCase):
             (2, 3., 24.),
             (3, 100., 104.)])
 
+    def test_frame_types(self):
+        Sample.create(counter=1, value=20.)
+        Sample.create(counter=2, value=1.)  # Observe logical peer handling.
 
-@skip_case_unless(isinstance(db, PostgresqlDatabase))
+        # Defaults to RANGE.
+        query = (Sample
+                 .select(Sample.counter, Sample.value,
+                         fn.SUM(Sample.value).over(
+                             order_by=[Sample.counter, Sample.value]))
+                 .order_by(Sample.id))
+        self.assertEqual(list(query.tuples()), [
+            (1, 10., 10.),
+            (1, 20., 50.),
+            (2, 1., 52.),
+            (2, 3., 55.),
+            (3, 100., 155.),
+            (1, 20., 50.),
+            (2, 1., 52.)])
+
+        # Explicitly specify ROWS.
+        query = (Sample
+                 .select(Sample.counter, Sample.value,
+                         fn.SUM(Sample.value).over(
+                             order_by=[Sample.counter, Sample.value],
+                             frame_type=Window.ROWS))
+                 .order_by(Sample.counter, Sample.value))
+        self.assertEqual(list(query.tuples()), [
+            (1, 10., 10.),
+            (1, 20., 30.),
+            (1, 20., 50.),
+            (2, 1., 51.),
+            (2, 1., 52.),
+            (2, 3., 55.),
+            (3, 100., 155.)])
+
+        # Including a boundary results in ROWS.
+        query = (Sample
+                 .select(Sample.counter, Sample.value,
+                         fn.SUM(Sample.value).over(
+                             order_by=[Sample.counter, Sample.value],
+                             start=Window.preceding(2)))
+                 .order_by(Sample.counter, Sample.value))
+        self.assertEqual(list(query.tuples()), [
+            (1, 10., 10.),
+            (1, 20., 30.),
+            (1, 20., 50.),
+            (2, 1., 41.),
+            (2, 1., 22.),
+            (2, 3., 5.),
+            (3, 100., 104.)])
+
+    @skip_if(IS_MYSQL, 'requires OVER() with FILTER')
+    def test_filter_clause(self):
+        condsum = fn.SUM(Sample.value).filter(Sample.counter > 1).over(
+            order_by=[Sample.id], start=Window.preceding(1))
+        query = (Sample
+                 .select(Sample.counter, Sample.value, condsum.alias('cs'))
+                 .order_by(Sample.value))
+        self.assertEqual(list(query.tuples()), [
+            (2, 1., 1.),
+            (2, 3., 4.),
+            (1, 10., None),
+            (1, 20., None),
+            (3, 100., 103.),
+        ])
+
+
+@skip_if(IS_SQLITE or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
 class TestForUpdateIntegration(ModelTestCase):
     requires = [User]
 
@@ -1397,14 +1733,14 @@ class TestForUpdateIntegration(ModelTestCase):
                         .for_update('FOR UPDATE NOWAIT')
                         .get())
 
-            self.assertRaises(OperationalError, will_fail)
+            self.assertRaises((OperationalError, InternalError), will_fail)
 
 
 class ServerDefault(TestModel):
     timestamp = DateTimeField(constraints=[SQL('default (now())')])
 
 
-@skip_case_unless(isinstance(db, PostgresqlDatabase))
+@requires_postgresql
 class TestReturningIntegration(ModelTestCase):
     requires = [User]
 
@@ -1450,7 +1786,7 @@ class TestReturningIntegration(ModelTestCase):
                  .insert()
                  .returning(ServerDefault.id, ServerDefault.timestamp))
         self.assertSQL(query, (
-            'INSERT INTO "serverdefault" '
+            'INSERT INTO "server_default" '
             'DEFAULT VALUES '
             'RETURNING "id", "timestamp"'), [])
 
@@ -1559,11 +1895,275 @@ class TestReturningIntegration(ModelTestCase):
         self.assertEqual(user.id, zaizee_id)
 
 
-supports_tuples = sqlite3.sqlite_version_info >= (3, 15, 0)
+class Member(TestModel):
+    name = TextField()
+    recommendedby = ForeignKeyField('self', null=True)
 
 
-@skip_case_unless(isinstance(db, PostgresqlDatabase) or
-                  (isinstance(db, SqliteDatabase) and supports_tuples))
+class TestCTEIntegration(ModelTestCase):
+    requires = [Category]
+
+    def setUp(self):
+        super(TestCTEIntegration, self).setUp()
+        CC = Category.create
+        root = CC(name='root')
+        p1 = CC(name='p1', parent=root)
+        p2 = CC(name='p2', parent=root)
+        p3 = CC(name='p3', parent=root)
+        c11 = CC(name='c11', parent=p1)
+        c12 = CC(name='c12', parent=p1)
+        c31 = CC(name='c31', parent=p3)
+
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    @requires_models(Member)
+    def test_docs_example(self):
+        f = Member.create(name='founder')
+        gen2_1 = Member.create(name='g2-1', recommendedby=f)
+        gen2_2 = Member.create(name='g2-2', recommendedby=f)
+        gen2_3 = Member.create(name='g2-3', recommendedby=f)
+        gen3_1_1 = Member.create(name='g3-1-1', recommendedby=gen2_1)
+        gen3_1_2 = Member.create(name='g3-1-2', recommendedby=gen2_1)
+        gen3_3_1 = Member.create(name='g3-3-1', recommendedby=gen2_3)
+
+        # Get recommender chain for 331.
+        base = (Member
+                .select(Member.recommendedby)
+                .where(Member.id == gen3_3_1.id)
+                .cte('recommenders', recursive=True, columns=('recommender',)))
+
+        MA = Member.alias()
+        recursive = (MA
+                     .select(MA.recommendedby)
+                     .join(base, on=(MA.id == base.c.recommender)))
+
+        cte = base.union_all(recursive)
+        query = (cte
+                 .select_from(cte.c.recommender, Member.name)
+                 .join(Member, on=(cte.c.recommender == Member.id))
+                 .order_by(Member.id.desc()))
+        self.assertEqual([m.name for m in query], ['g2-3', 'founder'])
+
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    def test_simple_cte(self):
+        cte = (Category
+               .select(Category.name, Category.parent)
+               .cte('catz', columns=('name', 'parent')))
+
+        cte_sql = ('WITH "catz" ("name", "parent") AS ('
+                   'SELECT "t1"."name", "t1"."parent_id" '
+                   'FROM "category" AS "t1") '
+                   'SELECT "catz"."name", "catz"."parent" AS "pname" '
+                   'FROM "catz" '
+                   'ORDER BY "catz"."name"')
+
+        query = (Category
+                 .select(cte.c.name, cte.c.parent.alias('pname'))
+                 .from_(cte)
+                 .order_by(cte.c.name)
+                 .with_cte(cte))
+        self.assertSQL(query, cte_sql, [])
+
+        query2 = (cte.select_from(cte.c.name, cte.c.parent.alias('pname'))
+                  .order_by(cte.c.name))
+        self.assertSQL(query2, cte_sql, [])
+
+        self.assertEqual([(row.name, row.pname) for row in query], [
+            ('c11', 'p1'),
+            ('c12', 'p1'),
+            ('c31', 'p3'),
+            ('p1', 'root'),
+            ('p2', 'root'),
+            ('p3', 'root'),
+            ('root', None)])
+        self.assertEqual([(row.name, row.pname) for row in query],
+                         [(row.name, row.pname) for row in query2])
+
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    def test_cte_join(self):
+        cte = (Category
+               .select(Category.name)
+               .cte('parents', columns=('name',)))
+
+        query = (Category
+                 .select(Category.name, cte.c.name.alias('pname'))
+                 .join(cte, on=(Category.parent == cte.c.name))
+                 .order_by(Category.name)
+                 .with_cte(cte))
+
+        self.assertSQL(query, (
+            'WITH "parents" ("name") AS ('
+            'SELECT "t1"."name" FROM "category" AS "t1") '
+            'SELECT "t2"."name", "parents"."name" AS "pname" '
+            'FROM "category" AS "t2" '
+            'INNER JOIN "parents" ON ("t2"."parent_id" = "parents"."name") '
+            'ORDER BY "t2"."name"'), [])
+        self.assertEqual([(c.name, c.parents['pname']) for c in query], [
+            ('c11', 'p1'),
+            ('c12', 'p1'),
+            ('c31', 'p3'),
+            ('p1', 'root'),
+            ('p2', 'root'),
+            ('p3', 'root'),
+        ])
+
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    def test_recursive_cte(self):
+        def get_parents(cname):
+            C1 = Category.alias()
+            C2 = Category.alias()
+
+            level = SQL('1').cast('integer').alias('level')
+            path = C1.name.cast('text').alias('path')
+
+            base = (C1
+                    .select(C1.name, C1.parent, level, path)
+                    .where(C1.name == cname)
+                    .cte('parents', recursive=True))
+
+            rlevel = (base.c.level + 1).alias('level')
+            rpath = base.c.path.concat('->').concat(C2.name).alias('path')
+            recursive = (C2
+                         .select(C2.name, C2.parent, rlevel, rpath)
+                         .from_(base)
+                         .join(C2, on=(C2.name == base.c.parent_id)))
+
+            cte = base + recursive
+            query = (cte
+                     .select_from(cte.c.name, cte.c.level, cte.c.path)
+                     .order_by(cte.c.level))
+            self.assertSQL(query, (
+                'WITH RECURSIVE "parents" AS ('
+                'SELECT "t1"."name", "t1"."parent_id", '
+                'CAST(1 AS integer) AS "level", '
+                'CAST("t1"."name" AS text) AS "path" '
+                'FROM "category" AS "t1" '
+                'WHERE ("t1"."name" = ?) '
+                'UNION ALL '
+                'SELECT "t2"."name", "t2"."parent_id", '
+                '("parents"."level" + ?) AS "level", '
+                '(("parents"."path" || ?) || "t2"."name") AS "path" '
+                'FROM "parents" '
+                'INNER JOIN "category" AS "t2" '
+                'ON ("t2"."name" = "parents"."parent_id")) '
+                'SELECT "parents"."name", "parents"."level", "parents"."path" '
+                'FROM "parents" '
+                'ORDER BY "parents"."level"'), [cname, 1, '->'])
+            return query
+
+        data = [row for row in get_parents('c31').tuples()]
+        self.assertEqual(data, [
+            ('c31', 1, 'c31'),
+            ('p3', 2, 'c31->p3'),
+            ('root', 3, 'c31->p3->root')])
+
+        data = [(c.name, c.level, c.path)
+                for c in get_parents('c12').namedtuples()]
+        self.assertEqual(data, [
+            ('c12', 1, 'c12'),
+            ('p1', 2, 'c12->p1'),
+            ('root', 3, 'c12->p1->root')])
+
+        query = get_parents('root')
+        data = [(r.name, r.level, r.path) for r in query]
+        self.assertEqual(data, [('root', 1, 'root')])
+
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    def test_recursive_cte2(self):
+        hierarchy = (Category
+                     .select(Category.name, Value(0).alias('level'))
+                     .where(Category.parent.is_null(True))
+                     .cte(name='hierarchy', recursive=True))
+
+        C = Category.alias()
+        recursive = (C
+                     .select(C.name, (hierarchy.c.level + 1).alias('level'))
+                     .join(hierarchy, on=(C.parent == hierarchy.c.name)))
+
+        cte = hierarchy.union_all(recursive)
+        query = (cte
+                 .select_from(cte.c.name, cte.c.level)
+                 .order_by(cte.c.name))
+        self.assertEqual([(r.name, r.level) for r in query], [
+            ('c11', 2),
+            ('c12', 2),
+            ('c31', 2),
+            ('p1', 1),
+            ('p2', 1),
+            ('p3', 1),
+            ('root', 0)])
+
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    def test_recursive_cte_docs_example(self):
+        # Define the base case of our recursive CTE. This will be categories that
+        # have a null parent foreign-key.
+        Base = Category.alias()
+        level = Value(1).cast('integer').alias('level')
+        path = Base.name.cast('text').alias('path')
+        base_case = (Base
+                     .select(Base.name, Base.parent, level, path)
+                     .where(Base.parent.is_null())
+                     .cte('base', recursive=True))
+
+        # Define the recursive terms.
+        RTerm = Category.alias()
+        rlevel = (base_case.c.level + 1).alias('level')
+        rpath = base_case.c.path.concat('->').concat(RTerm.name).alias('path')
+        recursive = (RTerm
+                     .select(RTerm.name, RTerm.parent, rlevel, rpath)
+                     .join(base_case, on=(RTerm.parent == base_case.c.name)))
+
+        # The recursive CTE is created by taking the base case and UNION ALL with
+        # the recursive term.
+        cte = base_case.union_all(recursive)
+
+        # We will now query from the CTE to get the categories, their levels,  and
+        # their paths.
+        query = (cte
+                 .select_from(cte.c.name, cte.c.level, cte.c.path)
+                 .order_by(cte.c.path))
+        data = [(obj.name, obj.level, obj.path) for obj in query]
+        self.assertEqual(data, [
+            ('root', 1, 'root'),
+            ('p1', 2, 'root->p1'),
+            ('c11', 3, 'root->p1->c11'),
+            ('c12', 3, 'root->p1->c12'),
+            ('p2', 2, 'root->p2'),
+            ('p3', 2, 'root->p3'),
+            ('c31', 3, 'root->p3->c31')])
+
+    @requires_models(Sample)
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'sqlite too old for ctes, mysql flaky')
+    def test_cte_reuse_aggregate(self):
+        data = (
+            (1, (1.25, 1.5, 1.75)),
+            (2, (2.1, 2.3, 2.5, 2.7, 2.9)),
+            (3, (3.5, 3.5)))
+        with self.database.atomic():
+            for counter, values in data:
+                (Sample
+                 .insert_many([(counter, value) for value in values],
+                              fields=[Sample.counter, Sample.value])
+                 .execute())
+
+        cte = (Sample
+               .select(Sample.counter, fn.AVG(Sample.value).alias('avg_value'))
+               .group_by(Sample.counter)
+               .cte('count_to_avg', columns=('counter', 'avg_value')))
+
+        query = (Sample
+                 .select(Sample.counter,
+                         (Sample.value - cte.c.avg_value).alias('diff'))
+                 .join(cte, on=(Sample.counter == cte.c.counter))
+                 .where(Sample.value > cte.c.avg_value)
+                 .order_by(Sample.value)
+                 .with_cte(cte))
+        self.assertEqual([(a, round(b, 2)) for a, b in query.tuples()], [
+            (1, .25),
+            (2, .2),
+            (2, .4)])
+
+
+@skip_unless(IS_POSTGRESQL or IS_SQLITE_15, 'requires row-value support')
 class TestTupleComparison(ModelTestCase):
     requires = [User]
 
@@ -1777,7 +2377,7 @@ class TestFieldInheritance(BaseTestCase):
         self.assertTrue(Category.itemb_set.rel_model is ItemB)
         self.assertTrue(Category.itemb_set.model is Category)
 
-    @skip_if(IS_SQLITE)
+    @skip_if(IS_SQLITE, 'sqlite is not supported')
     def test_deferred_fk_creation(self):
         class B(TestModel):
             a = DeferredForeignKey('A', null=True)
@@ -1815,6 +2415,34 @@ class TestFieldInheritance(BaseTestCase):
                 self.assertRaises(IntegrityError, B.create, a=fake_a, b='b3')
         finally:
             db.drop_tables([A, B])
+
+
+class TestMetaTableName(BaseTestCase):
+    def test_table_name_behavior(self):
+        def make_model(model_name, table=None):
+            class Meta:
+                legacy_table_names = False
+                table_name = table
+            return type(model_name, (Model,), {'Meta': Meta})
+        def assertTableName(expected, model_name, table_name=None):
+            model_class = make_model(model_name, table_name)
+            self.assertEqual(model_class._meta.table_name, expected)
+
+        assertTableName('users', 'User', 'users')
+        assertTableName('tweet', 'Tweet')
+        assertTableName('user_profile', 'UserProfile')
+        assertTableName('activity_log_status', 'ActivityLogStatus')
+
+        assertTableName('camel_case', 'CamelCase')
+        assertTableName('camel_camel_case', 'CamelCamelCase')
+        assertTableName('camel2_camel2_case', 'Camel2Camel2Case')
+        assertTableName('http_request', 'HTTPRequest')
+        assertTableName('api_response', 'APIResponse')
+        assertTableName('api_response', 'API_Response')
+        assertTableName('web_http_request', 'WebHTTPRequest')
+        assertTableName('get_http_response_code', 'getHTTPResponseCode')
+        assertTableName('foo_bar', 'foo_Bar')
+        assertTableName('foo_bar', 'Foo__Bar')
 
 
 class TestMetaInheritance(BaseTestCase):
@@ -1926,6 +2554,39 @@ class TestMetaInheritance(BaseTestCase):
         self.assertEqual(Overrides._meta.options, {'foo': 'bar'})
         self.assertTrue(Overrides._meta.schema is None)
 
+    def test_temporary_inheritance(self):
+        class T0(TestModel): pass
+        class T1(TestModel):
+            class Meta:
+                temporary = True
+
+        class T2(T1): pass
+        class T3(T1):
+            class Meta:
+                temporary = False
+
+        self.assertFalse(T0._meta.temporary)
+        self.assertTrue(T1._meta.temporary)
+        self.assertTrue(T2._meta.temporary)
+        self.assertFalse(T3._meta.temporary)
+
+
+class TestModelSetDatabase(BaseTestCase):
+    def test_set_database(self):
+        class Register(Model):
+            value = IntegerField()
+
+        db_a = get_in_memory_db()
+        db_b = get_in_memory_db()
+        Register._meta.set_database(db_a)
+        Register.create_table()
+        Register._meta.set_database(db_b)
+        self.assertFalse(Register.table_exists())
+        self.assertEqual(db_a.get_tables(), ['register'])
+        self.assertEqual(db_b.get_tables(), [])
+        db_a.close()
+        db_b.close()
+
 
 class TestForeignKeyFieldDescriptors(BaseTestCase):
     def test_foreign_key_field_descriptors(self):
@@ -2036,6 +2697,12 @@ class Emp(TestModel):
         )
 
 
+class OCTest(TestModel):
+    a = CharField(unique=True)
+    b = IntegerField(default=0)
+    c = IntegerField(default=0)
+
+
 class OnConflictTestCase(ModelTestCase):
     requires = [Emp]
     test_data = (
@@ -2064,10 +2731,99 @@ class OnConflictTestCase(ModelTestCase):
         self.assertData(list(self.test_data))
 
 
+@requires_mysql
+class TestUpsertMySQL(OnConflictTestCase):
+    def test_replace(self):
+        # Unique constraint on first/last would fail - replace.
+        query = (Emp
+                 .insert(first='mickey', last='dog', empno='1337')
+                 .on_conflict('replace')
+                 .execute())
+        self.assertData([
+            ('huey', 'cat', '123'),
+            ('zaizee', 'cat', '124'),
+            ('mickey', 'dog', '1337')])
+
+        # Unique constraint on empno would fail - replace.
+        query = (Emp
+                 .insert(first='nuggie', last='dog', empno='123')
+                 .on_conflict('replace')
+                 .execute())
+        self.assertData([
+            ('zaizee', 'cat', '124'),
+            ('mickey', 'dog', '1337'),
+            ('nuggie', 'dog', '123')])
+
+        # No problems, data added.
+        query = (Emp
+                 .insert(first='beanie', last='cat', empno='126')
+                 .on_conflict('replace')
+                 .execute())
+        self.assertData([
+            ('zaizee', 'cat', '124'),
+            ('mickey', 'dog', '1337'),
+            ('nuggie', 'dog', '123'),
+            ('beanie', 'cat', '126')])
+
+    @requires_models(OCTest)
+    def test_update(self):
+        pk = (OCTest
+              .insert(a='a', b=3)
+              .on_conflict(update={OCTest.b: 1337})
+              .execute())
+        oc = OCTest.get(OCTest.a == 'a')
+        self.assertEqual(oc.b, 3)
+
+        pk2 = (OCTest
+               .insert(a='a', b=4)
+               .on_conflict(update={OCTest.b: OCTest.b + 10})
+               .execute())
+        self.assertEqual(pk, pk2)
+        self.assertEqual(OCTest.select().count(), 1)
+
+        oc = OCTest.get(OCTest.a == 'a')
+        self.assertEqual(oc.b, 13)
+
+        pk3 = (OCTest
+               .insert(a='a2', b=5)
+               .on_conflict(update={OCTest.b: 1337})
+               .execute())
+        self.assertTrue(pk3 != pk2)
+        self.assertEqual(OCTest.select().count(), 2)
+
+        oc = OCTest.get(OCTest.a == 'a2')
+        self.assertEqual(oc.b, 5)
+
+    @requires_models(OCTest)
+    def test_update_preserve(self):
+        OCTest.create(a='a', b=3)
+
+        pk = (OCTest
+              .insert(a='a', b=4)
+              .on_conflict(preserve=[OCTest.b])
+              .execute())
+        oc = OCTest.get(OCTest.a == 'a')
+        self.assertEqual(oc.b, 4)
+
+        pk2 = (OCTest
+               .insert(a='a', b=5, c=6)
+               .on_conflict(
+                   preserve=[OCTest.c],
+                   update={OCTest.b: OCTest.b + 100})
+               .execute())
+        self.assertEqual(pk, pk2)
+        self.assertEqual(OCTest.select().count(), 1)
+
+        oc = OCTest.get(OCTest.a == 'a')
+        self.assertEqual(oc.b, 104)
+        self.assertEqual(oc.c, 6)
+
+
 class TestUpsertSqlite(OnConflictTestCase):
     database = get_in_memory_db()
 
     def test_replace(self):
+        # Unique constraint on first/last would fail - replace.
         query = (Emp
                  .insert(first='mickey', last='dog', empno='1337')
                  .on_conflict('replace')
@@ -2077,6 +2833,7 @@ class TestUpsertSqlite(OnConflictTestCase):
             ('zaizee', 'cat', '124'),
             ('mickey', 'dog', '1337')])
 
+        # Unique constraint on empno would fail - replace.
         query = (Emp
                  .insert(first='nuggie', last='dog', empno='123')
                  .on_conflict('replace')
@@ -2086,37 +2843,72 @@ class TestUpsertSqlite(OnConflictTestCase):
             ('mickey', 'dog', '1337'),
             ('nuggie', 'dog', '123')])
 
-
-@skip_case_unless(IS_MYSQL)
-class TestUpsertMySQL(OnConflictTestCase):
-    def test_replace(self):
+        # No problems, data added.
         query = (Emp
-                 .insert(first='mickey', last='dog', empno='1337')
+                 .insert(first='beanie', last='cat', empno='126')
                  .on_conflict('replace')
                  .execute())
+        self.assertData([
+            ('zaizee', 'cat', '124'),
+            ('mickey', 'dog', '1337'),
+            ('nuggie', 'dog', '123'),
+            ('beanie', 'cat', '126')])
+
+    def test_model_replace(self):
+        Emp.replace(first='mickey', last='dog', empno='1337').execute()
         self.assertData([
             ('huey', 'cat', '123'),
             ('zaizee', 'cat', '124'),
             ('mickey', 'dog', '1337')])
 
-        query = (Emp
-                 .insert(first='nuggie', last='dog', empno='123')
-                 .on_conflict('replace')
-                 .execute())
+        Emp.replace(first='beanie', last='cat', empno='999').execute()
         self.assertData([
+            ('huey', 'cat', '123'),
             ('zaizee', 'cat', '124'),
             ('mickey', 'dog', '1337'),
-            ('nuggie', 'dog', '123')])
+            ('beanie', 'cat', '999')])
 
+        Emp.replace_many([('h', 'cat', '123'), ('z', 'cat', '124'),
+                          ('b', 'cat', '125')],
+                         fields=[Emp.first, Emp.last, Emp.empno]).execute()
+        self.assertData([
+            ('mickey', 'dog', '1337'),
+            ('beanie', 'cat', '999'),
+            ('h', 'cat', '123'),
+            ('z', 'cat', '124'),
+            ('b', 'cat', '125')])
 
-class OCTest(TestModel):
-    a = CharField(unique=True)
-    b = IntegerField(default=0)
+    @skip_if(IS_SQLITE_24, 'requires sqlite < 3.24')
+    def test_no_preserve_update_where(self):
+        # Ensure on SQLite < 3.24 we cannot update or preserve values.
+        base = Emp.insert(first='foo', last='bar', empno='125')
 
+        preserve = base.on_conflict(preserve=[Emp.last])
+        self.assertRaises(ValueError, preserve.execute)
 
-@skip_case_unless(IS_POSTGRESQL)
-class TestUpsertPostgresql(OnConflictTestCase):
+        update = base.on_conflict(update={Emp.empno: 'xxx'})
+        self.assertRaises(ValueError, update.execute)
+
+        where = base.on_conflict(where=(Emp.id > 10))
+        self.assertRaises(ValueError, where.execute)
+
+    @skip_unless(IS_SQLITE_24, 'requires sqlite >= 3.24')
+    def test_update_meets_requirements(self):
+        # Ensure that on >= 3.24 any updates meet the minimum criteria.
+        base = Emp.insert(first='foo', last='bar', empno='125')
+
+        # Must specify update or preserve.
+        no_update_preserve = base.on_conflict(conflict_target=(Emp.empno,))
+        self.assertRaises(ValueError, no_update_preserve.execute)
+
+        # Must specify a conflict target.
+        no_conflict_target = base.on_conflict(update={Emp.empno: '125.1'})
+        self.assertRaises(ValueError, no_conflict_target.execute)
+
+    @skip_unless(IS_SQLITE_24, 'requires sqlite >= 3.24')
     def test_update(self):
+        # Conflict on empno - we'll preserve name and update the ID. This will
+        # overwrite the previous row and set a new ID.
         res = (Emp
                .insert(first='foo', last='bar', empno='125')
                .on_conflict(
@@ -2129,6 +2921,123 @@ class TestUpsertPostgresql(OnConflictTestCase):
             ('zaizee', 'cat', '124'),
             ('foo', 'bar', '125.1')])
 
+        # Conflicts on first/last name. The first name is preserved while the
+        # last-name is updated. The new empno is thrown out.
+        res = (Emp
+               .insert(first='foo', last='bar', empno='126')
+               .on_conflict(
+                   conflict_target=(Emp.first, Emp.last),
+                   preserve=(Emp.first,),
+                   update={Emp.last: 'baze'})
+               .execute())
+        self.assertData([
+            ('huey', 'cat', '123'),
+            ('zaizee', 'cat', '124'),
+            ('foo', 'baze', '125.1')])
+
+    @skip_unless(IS_SQLITE_24, 'requires sqlite >= 3.24')
+    @requires_models(OCTest)
+    def test_update_atomic(self):
+        # Add a new row with the given "a" value. If a conflict occurs,
+        # re-insert with b=b+2.
+        query = OCTest.insert(a='foo', b=1).on_conflict(
+            conflict_target=(OCTest.a,),
+            update={OCTest.b: OCTest.b + 2})
+
+        # Sanity-check the SQL.
+        self.assertSQL(query, (
+            'INSERT INTO "oc_test" ("a", "b", "c") VALUES (?, ?, ?) '
+            'ON CONFLICT ("a") '
+            'DO UPDATE SET "b" = ("oc_test"."b" + ?)'), ['foo', 1, 0, 2])
+
+        # First execution returns rowid=1. Second execution hits the conflict-
+        # resolution, and will update the value in "b" from 1 -> 3.
+        rowid1 = query.execute()
+        rowid2 = query.clone().execute()
+        self.assertEqual(rowid1, rowid2)
+
+        obj = OCTest.get()
+        self.assertEqual(obj.a, 'foo')
+        self.assertEqual(obj.b, 3)
+
+        query = OCTest.insert(a='foo', b=4, c=5).on_conflict(
+            conflict_target=[OCTest.a],
+            preserve=[OCTest.c],
+            update={OCTest.b: OCTest.b + 100})
+        self.assertEqual(query.execute(), rowid2)
+
+        obj = OCTest.get()
+        self.assertEqual(obj.a, 'foo')
+        self.assertEqual(obj.b, 103)
+        self.assertEqual(obj.c, 5)
+
+    @skip_unless(IS_SQLITE_24, 'requires sqlite >= 3.24')
+    @requires_models(OCTest)
+    def test_update_where_clause(self):
+        # Add a new row with the given "a" value. If a conflict occurs,
+        # re-insert with b=b+2 so long as the original b < 3.
+        query = OCTest.insert(a='foo', b=1).on_conflict(
+            conflict_target=(OCTest.a,),
+            update={OCTest.b: OCTest.b + 2},
+            where=(OCTest.b < 3))
+        self.assertSQL(query, (
+            'INSERT INTO "oc_test" ("a", "b", "c") VALUES (?, ?, ?) '
+            'ON CONFLICT ("a") DO UPDATE SET "b" = ("oc_test"."b" + ?) '
+            'WHERE ("oc_test"."b" < ?)'), ['foo', 1, 0, 2, 3])
+
+        # First execution returns rowid=1. Second execution hits the conflict-
+        # resolution, and will update the value in "b" from 1 -> 3.
+        rowid1 = query.execute()
+        rowid2 = query.clone().execute()
+        self.assertEqual(rowid1, rowid2)
+
+        obj = OCTest.get()
+        self.assertEqual(obj.a, 'foo')
+        self.assertEqual(obj.b, 3)
+
+        # Third execution also returns rowid=1. The WHERE clause prevents us
+        # from updating "b" again, so it remains 3.
+        rowid3 = query.clone().execute()
+        self.assertEqual(rowid1, rowid3)
+
+        # Because we didn't satisfy the WHERE clause, the value in "b" is
+        # not incremented again.
+        obj = OCTest.get()
+        self.assertEqual(obj.a, 'foo')
+        self.assertEqual(obj.b, 3)
+
+    @skip_unless(IS_SQLITE_24, 'requires sqlite >= 3.24')
+    def test_do_nothing(self):
+        query = (Emp
+                 .insert(first='foo', last='bar', empno='123')
+                 .on_conflict('nothing'))
+        self.assertSQL(query, (
+            'INSERT INTO "emp" ("first", "last", "empno") '
+            'VALUES (?, ?, ?) ON CONFLICT DO NOTHING'), ['foo', 'bar', '123'])
+
+        query.execute()  # Conflict occurs with empno='123'.
+        self.assertData(list(self.test_data))
+
+
+@requires_postgresql
+class TestUpsertPostgresql(OnConflictTestCase):
+    def test_update(self):
+        # Conflict on empno - we'll preserve name and update the ID. This will
+        # overwrite the previous row and set a new ID.
+        res = (Emp
+               .insert(first='foo', last='bar', empno='125')
+               .on_conflict(
+                   conflict_target=(Emp.empno,),
+                   preserve=(Emp.first, Emp.last),
+                   update={Emp.empno: '125.1'})
+               .execute())
+        self.assertData([
+            ('huey', 'cat', '123'),
+            ('zaizee', 'cat', '124'),
+            ('foo', 'bar', '125.1')])
+
+        # Conflicts on first/last name. The first name is preserved while the
+        # last-name is updated. The new empno is thrown out.
         res = (Emp
                .insert(first='foo', last='bar', empno='126')
                .on_conflict(
@@ -2143,14 +3052,18 @@ class TestUpsertPostgresql(OnConflictTestCase):
 
     @requires_models(OCTest)
     def test_update_atomic(self):
+        # Add a new row with the given "a" value. If a conflict occurs,
+        # re-insert with b=b+2.
         query = OCTest.insert(a='foo', b=1).on_conflict(
             conflict_target=(OCTest.a,),
             update={OCTest.b: OCTest.b + 2})
         self.assertSQL(query, (
-            'INSERT INTO "octest" ("a", "b") VALUES (?, ?) '
-            'ON CONFLICT ("a") DO UPDATE SET "b" = ("octest"."b" + ?) '
-            'RETURNING "id"'), ['foo', 1, 2])
+            'INSERT INTO "oc_test" ("a", "b", "c") VALUES (?, ?, ?) '
+            'ON CONFLICT ("a") DO UPDATE SET "b" = ("oc_test"."b" + ?) '
+            'RETURNING "id"'), ['foo', 1, 0, 2])
 
+        # First execution returns rowid=1. Second execution hits the conflict-
+        # resolution, and will update the value in "b" from 1 -> 3.
         rowid1 = query.execute()
         rowid2 = query.clone().execute()
         self.assertEqual(rowid1, rowid2)
@@ -2159,18 +3072,33 @@ class TestUpsertPostgresql(OnConflictTestCase):
         self.assertEqual(obj.a, 'foo')
         self.assertEqual(obj.b, 3)
 
+        query = OCTest.insert(a='foo', b=4, c=5).on_conflict(
+            conflict_target=[OCTest.a],
+            preserve=[OCTest.c],
+            update={OCTest.b: OCTest.b + 100})
+        self.assertEqual(query.execute(), rowid2)
+
+        obj = OCTest.get()
+        self.assertEqual(obj.a, 'foo')
+        self.assertEqual(obj.b, 103)
+        self.assertEqual(obj.c, 5)
+
     @requires_models(OCTest)
     def test_update_where_clause(self):
+        # Add a new row with the given "a" value. If a conflict occurs,
+        # re-insert with b=b+2 so long as the original b < 3.
         query = OCTest.insert(a='foo', b=1).on_conflict(
             conflict_target=(OCTest.a,),
             update={OCTest.b: OCTest.b + 2},
             where=(OCTest.b < 3))
         self.assertSQL(query, (
-            'INSERT INTO "octest" ("a", "b") VALUES (?, ?) '
-            'ON CONFLICT ("a") DO UPDATE SET "b" = ("octest"."b" + ?) '
-            'WHERE ("octest"."b" < ?) '
-            'RETURNING "id"'), ['foo', 1, 2, 3])
+            'INSERT INTO "oc_test" ("a", "b", "c") VALUES (?, ?, ?) '
+            'ON CONFLICT ("a") DO UPDATE SET "b" = ("oc_test"."b" + ?) '
+            'WHERE ("oc_test"."b" < ?) '
+            'RETURNING "id"'), ['foo', 1, 0, 2, 3])
 
+        # First execution returns rowid=1. Second execution hits the conflict-
+        # resolution, and will update the value in "b" from 1 -> 3.
         rowid1 = query.execute()
         rowid2 = query.clone().execute()
         self.assertEqual(rowid1, rowid2)
@@ -2179,8 +3107,10 @@ class TestUpsertPostgresql(OnConflictTestCase):
         self.assertEqual(obj.a, 'foo')
         self.assertEqual(obj.b, 3)
 
+        # Third execution returns rowid=None. The WHERE clause prevents us
+        # from updating "b" again, so nothing happened.
         rowid3 = query.clone().execute()
-        self.assertEqual(rowid1, rowid2)
+        self.assertTrue(rowid3 is None)
 
         # Because we didn't satisfy the WHERE clause, the value in "b" is
         # not incremented again.
@@ -2243,56 +3173,6 @@ class TestJoinSubquery(ModelTestCase):
 
         db_data = [row for row in query.tuples()]
         self.assertEqual(db_data, list(data))
-
-
-class User2(TestModel):
-    username = TextField()
-
-
-class Category2(TestModel):
-    name = TextField()
-    parent = ForeignKeyField('self', backref='children', null=True)
-    user = ForeignKeyField(User2)
-
-
-class TestGithub1354(ModelTestCase):
-    @requires_models(Category2, User2)
-    def test_get_or_create_self_referential_fk2(self):
-        huey = User2.create(username='huey')
-        parent = Category2.create(name='parent', user=huey)
-        child, created = Category2.get_or_create(parent=parent, name='child',
-                                                 user=huey)
-        child_db = Category2.get(Category2.parent == parent)
-        self.assertEqual(child_db.user.username, 'huey')
-        self.assertEqual(child_db.parent.name, 'parent')
-        self.assertEqual(child_db.name, 'child')
-
-
-class TestCountUnionRegression(ModelTestCase):
-    @requires_models(User)
-    @skip_if(IS_MYSQL)
-    def test_count_union(self):
-        with self.database.atomic():
-            for i in range(5):
-                User.create(username='user-%d' % i)
-
-        lhs = User.select()
-        rhs = User.select()
-        query = (lhs & rhs)
-        self.assertSQL(query, (
-            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
-            'INTERSECT '
-            'SELECT "t2"."id", "t2"."username" FROM "users" AS "t2"'), [])
-
-        self.assertEqual(query.count(), 5)
-
-        query = query.limit(3)
-        self.assertSQL(query, (
-            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
-            'INTERSECT '
-            'SELECT "t2"."id", "t2"."username" FROM "users" AS "t2" '
-            'LIMIT 3'), [])
-        self.assertEqual(query.count(), 3)
 
 
 class TestSumCase(ModelTestCase):
@@ -2442,14 +3322,14 @@ class SequenceModel(TestModel):
     key = TextField()
 
 
-@skip_case_unless(IS_POSTGRESQL)
+@requires_postgresql
 class TestSequence(ModelTestCase):
     requires = [SequenceModel]
 
     def test_create_table(self):
         query = SequenceModel._schema._create_table()
         self.assertSQL(query, (
-            'CREATE TABLE IF NOT EXISTS "sequencemodel" ('
+            'CREATE TABLE IF NOT EXISTS "sequence_model" ('
             '"id" SERIAL NOT NULL PRIMARY KEY, '
             '"seq_id" INTEGER NOT NULL DEFAULT NEXTVAL(\'seq_id_sequence\'), '
             '"key" TEXT NOT NULL)'), [])
@@ -2463,3 +3343,302 @@ class TestSequence(ModelTestCase):
         self.assertEqual(s1.seq_id, 1)
         self.assertEqual(s2.seq_id, 2)
         self.assertEqual(s3.seq_id, 3)
+
+
+@requires_postgresql
+class TestUpdateFromIntegration(ModelTestCase):
+    requires = [User]
+
+    def test_update_from(self):
+        u1, u2 = [User.create(username=username) for username in ('u1', 'u2')]
+        data = [(u1.id, 'u1-x'), (u2.id, 'u2-x')]
+        vl = ValuesList(data, columns=('id', 'username'), alias='tmp')
+        (User
+         .update({User.username: QualifiedNames(vl.c.username)})
+         .from_(vl)
+         .where(QualifiedNames(User.id == vl.c.id))
+         .execute())
+
+        usernames = [u.username for u in User.select().order_by(User.username)]
+        self.assertEqual(usernames, ['u1-x', 'u2-x'])
+
+    def test_update_from_subselect(self):
+        u1, u2 = [User.create(username=username) for username in ('u1', 'u2')]
+        data = [(u1.id, 'u1-y'), (u2.id, 'u2-y')]
+        vl = ValuesList(data, columns=('id', 'username'), alias='tmp')
+        subq = vl.select(vl.c.id, vl.c.username)
+        (User
+         .update({User.username: QualifiedNames(subq.c.username)})
+         .from_(subq)
+         .where(QualifiedNames(User.id == subq.c.id))
+         .execute())
+
+        usernames = [u.username for u in User.select().order_by(User.username)]
+        self.assertEqual(usernames, ['u1-y', 'u2-y'])
+
+    @requires_models(User, Tweet)
+    def test_update_from_simple(self):
+        u = User.create(username='u1')
+        t1 = Tweet.create(user=u, content='t1')
+        t2 = Tweet.create(user=u, content='t2')
+
+        (User
+         .update({User.username: QualifiedNames(Tweet.content)})
+         .from_(Tweet)
+         .where(Tweet.content == 't2')
+         .execute())
+
+        self.assertEqual(User.get(User.id == u.id).username, 't2')
+
+
+@requires_postgresql
+class TestLateralJoin(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_lateral_join(self):
+        with self.database.atomic():
+            for i in range(3):
+                u = User.create(username='u%s' % i)
+                for j in range(4):
+                    Tweet.create(user=u, content='u%s-t%s' % (i, j))
+
+        # GOAL: query users and their 2 most-recent tweets (by ID).
+        TA = Tweet.alias()
+
+        # The "outer loop" will be iterating over the users whose tweets we are
+        # trying to find.
+        user_query = (User
+                      .select(User.id, User.username)
+                      .order_by(User.id)
+                      .alias('uq'))
+
+        # The inner loop will select tweets and is correlated to the outer loop
+        # via the WHERE clause. Note that we are using a LIMIT clause.
+        tweet_query = (TA
+                       .select(TA.id, TA.content)
+                       .where(TA.user == user_query.c.id)
+                       .order_by(TA.id.desc())
+                       .limit(2)
+                       .alias('pq'))
+
+        join = NodeList((user_query, SQL('LEFT JOIN LATERAL'), tweet_query,
+                         SQL('ON %s', [True])))
+        query = (Tweet
+                 .select(user_query.c.username, tweet_query.c.content)
+                 .from_(join)
+                 .dicts())
+        self.assertEqual([row for row in query], [
+            {'username': 'u0', 'content': 'u0-t3'},
+            {'username': 'u0', 'content': 'u0-t2'},
+            {'username': 'u1', 'content': 'u1-t3'},
+            {'username': 'u1', 'content': 'u1-t2'},
+            {'username': 'u2', 'content': 'u2-t3'},
+            {'username': 'u2', 'content': 'u2-t2'}])
+
+
+class Task(TestModel):
+    heading = ForeignKeyField('self', backref='tasks', null=True)
+    project = ForeignKeyField('self', backref='projects', null=True)
+    title = TextField()
+    type = IntegerField()
+
+    PROJECT = 1
+    HEADING = 2
+
+
+class TestMultiSelfJoin(ModelTestCase):
+    requires = [Task]
+
+    def setUp(self):
+        super(TestMultiSelfJoin, self).setUp()
+
+        with self.database.atomic():
+            p_dev = Task.create(title='dev', type=Task.PROJECT)
+            p_p = Task.create(title='peewee', project=p_dev, type=Task.PROJECT)
+            p_h = Task.create(title='huey', project=p_dev, type=Task.PROJECT)
+
+            heading_data = (
+                ('peewee-1', p_p, 2),
+                ('peewee-2', p_p, 0),
+                ('huey-1', p_h, 1),
+                ('huey-2', p_h, 1))
+            for title, proj, n_subtasks in heading_data:
+                t = Task.create(title=title, project=proj, type=Task.HEADING)
+                for i in range(n_subtasks):
+                    Task.create(title='%s-%s' % (title, i + 1), project=proj,
+                                heading=t, type=Task.HEADING)
+
+    def test_multi_self_join(self):
+        Project = Task.alias()
+        Heading = Task.alias()
+        query = (Task
+                 .select(Task, Project, Heading)
+                 .join(Heading, JOIN.LEFT_OUTER,
+                       on=(Task.heading == Heading.id).alias('heading'))
+                 .switch(Task)
+                 .join(Project, JOIN.LEFT_OUTER,
+                       on=(Task.project == Project.id).alias('project'))
+                 .order_by(Task.id))
+
+        with self.assertQueryCount(1):
+            accum = []
+            for task in query:
+                h_title = task.heading.title if task.heading else None
+                p_title = task.project.title if task.project else None
+                accum.append((task.title, h_title, p_title))
+
+        self.assertEqual(accum, [
+            # title - heading - project
+            ('dev', None, None),
+            ('peewee', None, 'dev'),
+            ('huey', None, 'dev'),
+            ('peewee-1', None, 'peewee'),
+            ('peewee-1-1', 'peewee-1', 'peewee'),
+            ('peewee-1-2', 'peewee-1', 'peewee'),
+            ('peewee-2', None, 'peewee'),
+            ('huey-1', None, 'huey'),
+            ('huey-1-1', 'huey-1', 'huey'),
+            ('huey-2', None, 'huey'),
+            ('huey-2-1', 'huey-2', 'huey'),
+        ])
+
+
+class Product(TestModel):
+    name = TextField()
+    price = IntegerField()
+    flags = IntegerField(constraints=[SQL('DEFAULT 99')])
+
+    class Meta:
+        constraints = [Check('price > 0')]
+
+
+class TestModelConstraints(ModelTestCase):
+    requires = [Product]
+
+    @skip_if(IS_MYSQL)  # MySQL fails intermittently on Travis-CI (?).
+    def test_model_constraints(self):
+        p = Product.create(name='p1', price=1)
+        self.assertTrue(p.flags is None)
+
+        # Price was saved successfully, flags got server-side default value.
+        p_db = Product.get(Product.id == p.id)
+        self.assertEqual(p_db.price, 1)
+        self.assertEqual(p_db.flags, 99)
+
+        # Cannot update price with invalid value, must be > 0.
+        with self.database.atomic():
+            p.price = -1
+            self.assertRaises(IntegrityError, p.save)
+
+        # Nor can we create a new product with an invalid price.
+        with self.database.atomic():
+            self.assertRaises(IntegrityError, Product.create, name='p2',
+                              price=0)
+
+
+class TestModelFieldReprs(BaseTestCase):
+    def test_model_reprs(self):
+        class User(Model):
+            username = TextField(primary_key=True)
+        class Tweet(Model):
+            user = ForeignKeyField(User, backref='tweets')
+            content = TextField()
+            timestamp = TimestampField()
+        class EAV(Model):
+            entity = TextField()
+            attribute = TextField()
+            value = TextField()
+            class Meta:
+                primary_key = CompositeKey('entity', 'attribute')
+        class NoPK(Model):
+            key = TextField()
+            class Meta:
+                primary_key = False
+
+        self.assertEqual(repr(User), '<Model: User>')
+        self.assertEqual(repr(Tweet), '<Model: Tweet>')
+        self.assertEqual(repr(EAV), '<Model: EAV>')
+        self.assertEqual(repr(NoPK), '<Model: NoPK>')
+
+        self.assertEqual(repr(User()), '<User: None>')
+        self.assertEqual(repr(Tweet()), '<Tweet: None>')
+        self.assertEqual(repr(EAV()), '<EAV: (None, None)>')
+        self.assertEqual(repr(NoPK()), '<NoPK: n/a>')
+
+        self.assertEqual(repr(User(username='huey')), '<User: huey>')
+        self.assertEqual(repr(Tweet(id=1337)), '<Tweet: 1337>')
+        self.assertEqual(repr(EAV(entity='e', attribute='a')),
+                         "<EAV: ('e', 'a')>")
+        self.assertEqual(repr(NoPK(key='k')), '<NoPK: n/a>')
+
+        self.assertEqual(repr(User.username), '<TextField: User.username>')
+        self.assertEqual(repr(Tweet.user), '<ForeignKeyField: Tweet.user>')
+        self.assertEqual(repr(EAV.entity), '<TextField: EAV.entity>')
+
+        self.assertEqual(repr(TextField()), '<TextField: (unbound)>')
+
+    def test_model_str_method(self):
+        class User(Model):
+            username = TextField(primary_key=True)
+
+            def __str__(self):
+                return self.username.title()
+
+        u = User(username='charlie')
+        self.assertEqual(repr(u), '<User: Charlie>')
+
+
+class TestGetWithSecondDatabase(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User]
+
+    def test_get_with_second_database(self):
+        User.create(username='huey')
+        query = User.select().where(User.username == 'huey')
+        self.assertEqual(query.get().username, 'huey')
+
+        alt_db = get_in_memory_db()
+        with User.bind_ctx(alt_db):
+            User.create_table()
+
+        self.assertRaises(User.DoesNotExist, query.get, alt_db)
+        with User.bind_ctx(alt_db):
+            User.create(username='zaizee')
+
+        query = User.select().where(User.username == 'zaizee')
+        self.assertRaises(User.DoesNotExist, query.get)
+        self.assertEqual(query.get(alt_db).username, 'zaizee')
+
+
+class TestMixModelsTables(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User]
+
+    def test_mix_models_tables(self):
+        Tbl = User._meta.table
+        self.assertEqual(Tbl.insert({Tbl.username: 'huey'}).execute(), 1)
+
+        huey = Tbl.select(User.username).get()
+        self.assertEqual(huey, {'username': 'huey'})
+
+        huey = User.select(Tbl.username).get()
+        self.assertEqual(huey.username, 'huey')
+
+        Tbl.update(username='huey-x').where(Tbl.username == 'huey').execute()
+        self.assertEqual(User.select().get().username, 'huey-x')
+
+        Tbl.delete().where(User.username == 'huey-x').execute()
+        self.assertEqual(Tbl.select().count(), 0)
+
+
+class TestDatabaseExecuteQuery(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User]
+
+    def test_execute_query(self):
+        for username in ('huey', 'zaizee'):
+            User.create(username=username)
+
+        query = User.select().order_by(User.username.desc())
+        cursor = self.database.execute(query)
+        self.assertEqual([row[1] for row in cursor], ['zaizee', 'huey'])

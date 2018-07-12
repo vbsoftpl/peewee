@@ -1,5 +1,6 @@
 #coding:utf-8
 import datetime
+from decimal import Decimal as Dc
 from types import MethodType
 
 from peewee import *
@@ -9,7 +10,8 @@ from .base import BaseTestCase
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db_loader
-from .base import skip_case_if
+from .base import requires_models
+from .base import skip_unless
 from .base_models import Register
 
 
@@ -30,6 +32,10 @@ class ArrayModel(TestModel):
 class ArrayTSModel(TestModel):
     key = CharField(max_length=100, primary_key=True)
     timestamps = ArrayField(TimestampField, convert_values=True)
+
+
+class DecimalArray(TestModel):
+    values = ArrayField(DecimalField, field_kwargs={'decimal_places': 1})
 
 
 class FTSModel(TestModel):
@@ -306,6 +312,16 @@ class TestArrayField(ModelTestCase):
         row = AM.select(I[1:2][0].alias('ints')).dicts().get()
         self.assertEqual(row['ints'], [[3], [5]])
 
+    @requires_models(DecimalArray)
+    def test_field_kwargs(self):
+        vl1, vl2 = [Dc('3.1'), Dc('1.3')], [Dc('3.14'), Dc('1')]
+        da1, da2 = [DecimalArray.create(values=vl) for vl in (vl1, vl2)]
+
+        da1_db = DecimalArray.get(DecimalArray.id == da1.id)
+        da2_db = DecimalArray.get(DecimalArray.id == da2.id)
+        self.assertEqual(da1_db.values, [Dc('3.1'), Dc('1.3')])
+        self.assertEqual(da2_db.values, [Dc('3.1'), Dc('1.0')])
+
 
 class TestArrayFieldConvertValues(ModelTestCase):
     database = db
@@ -366,7 +382,7 @@ class TestTSVectorField(ModelTestCase):
         query = FTSModel.select().where(Match(FTSModel.data, 'foo bar'))
         self.assertSQL(query, (
             'SELECT "t1"."id", "t1"."title", "t1"."data", "t1"."fts_data" '
-            'FROM "ftsmodel" AS "t1" '
+            'FROM "fts_model" AS "t1" '
             'WHERE (to_tsvector("t1"."data") @@ to_tsquery(?))'), ['foo bar'])
 
     def test_match_function(self):
@@ -536,18 +552,14 @@ class BaseJsonFieldTestCase(object):
         self.assertItems((self.M.data['k2']['xxx'] == 'v1'))
 
 
-def json_ok():
-    if JsonModel is None:
-        return False
-    return pg93()
-
-
 def pg93():
     with db:
         return db.connection().server_version >= 90300
 
+JSON_SUPPORT = (JsonModel is not None) and pg93()
 
-@skip_case_if(lambda: not json_ok())
+
+@skip_unless(JSON_SUPPORT, 'json support unavailable')
 class TestJsonField(BaseJsonFieldTestCase, ModelTestCase):
     M = JsonModel
     database = db
@@ -567,7 +579,7 @@ class TestJsonField(BaseJsonFieldTestCase, ModelTestCase):
         self.assertEqual(query.get(), tjn)
 
 
-@skip_case_if(lambda: not json_ok())
+@skip_unless(JSON_SUPPORT, 'json support unavailable')
 class TestBinaryJsonField(BaseJsonFieldTestCase, ModelTestCase):
     M = BJson
     database = db
@@ -764,7 +776,7 @@ class TestIndexedField(BaseTestCase):
 
         create_sql, _ = IndexedModel._schema._create_table(False).query()
         self.assertEqual(create_sql, (
-            'CREATE TABLE "indexedmodel" ('
+            'CREATE TABLE "indexed_model" ('
             '"id" SERIAL NOT NULL PRIMARY KEY, '
             '"array_index" VARCHAR(255)[] NOT NULL, '
             '"array_noindex" INTEGER[] NOT NULL, '
@@ -775,12 +787,12 @@ class TestIndexedField(BaseTestCase):
         indexes = [idx.query()[0]
                    for idx in IndexedModel._schema._create_indexes(False)]
         self.assertEqual(indexes, [
-            ('CREATE INDEX "indexedmodel_array_index" ON "indexedmodel" '
+            ('CREATE INDEX "indexed_model_array_index" ON "indexed_model" '
              'USING GIN ("array_index")'),
-            ('CREATE INDEX "indexedmodel_fake_index" ON "indexedmodel" '
+            ('CREATE INDEX "indexed_model_fake_index" ON "indexed_model" '
              'USING GiST ("fake_index")'),
-            ('CREATE INDEX "indexedmodel_fake_index_with_type" '
-             'ON "indexedmodel" '
+            ('CREATE INDEX "indexed_model_fake_index_with_type" '
+             'ON "indexed_model" '
              'USING MAGIC ("fake_index_with_type")')])
 
 

@@ -13,7 +13,8 @@ features. This guide will cover:
 .. note::
     If you'd like something a bit more meaty, there is a thorough tutorial on
     :ref:`creating a "twitter"-style web app <example-app>` using peewee and the
-    Flask framework.
+    Flask framework. In the projects ``examples/`` folder you can find more
+    self-contained Peewee examples, like a `blog app <https://github.com/coleifer/peewee/tree/master/examples/blog>`_.
 
 I **strongly** recommend opening an interactive shell session and running the
 code. That way you can get a feel for typing in queries.
@@ -45,7 +46,6 @@ data model, by defining one or more :py:class:`Model` classes:
     class Person(Model):
         name = CharField()
         birthday = DateField()
-        is_relative = BooleanField()
 
         class Meta:
             database = db # This model uses the "people.db" database.
@@ -61,8 +61,7 @@ by the database, so you can use Python types in your code without having to
 worry.
 
 Things get interesting when we set up relationships between models using
-`foreign keys (wikipedia) <http://en.wikipedia.org/wiki/Foreign_key>`_. This is
-easy to do with peewee:
+:ref:`foreign key relationships <relationships>`. This is simple with peewee:
 
 .. code-block:: python
 
@@ -106,7 +105,7 @@ people's records.
 .. code-block:: python
 
     from datetime import date
-    uncle_bob = Person(name='Bob', birthday=date(1960, 1, 15), is_relative=True)
+    uncle_bob = Person(name='Bob', birthday=date(1960, 1, 15))
     uncle_bob.save() # bob is now stored in the database
     # Returns: 1
 
@@ -119,8 +118,8 @@ returns a model instance:
 
 .. code-block:: python
 
-    grandma = Person.create(name='Grandma', birthday=date(1935, 3, 1), is_relative=True)
-    herb = Person.create(name='Herb', birthday=date(1950, 5, 5), is_relative=False)
+    grandma = Person.create(name='Grandma', birthday=date(1935, 3, 1))
+    herb = Person.create(name='Herb', birthday=date(1950, 5, 5))
 
 To update a row, modify the model instance and call :py:meth:`~Model.save` to
 persist the changes. Here we will change Grandma's name and then save the
@@ -162,7 +161,6 @@ adopts Fido:
 
     herb_fido.owner = uncle_bob
     herb_fido.save()
-    bob_fido = herb_fido # rename our variable for clarity
 
 .. _retrieving-data:
 
@@ -197,12 +195,12 @@ Let's list all the people in the database:
 .. code-block:: python
 
     for person in Person.select():
-        print(person.name, person.is_relative)
+        print(person.name)
 
     # prints:
-    # Bob True
-    # Grandma L. True
-    # Herb False
+    # Bob
+    # Grandma L.
+    # Herb
 
 Let's list all the cats and their owner's name:
 
@@ -216,11 +214,15 @@ Let's list all the cats and their owner's name:
     # Kitty Bob
     # Mittens Jr Herb
 
-There is a big problem with the previous query: because we are accessing
-``pet.owner.name`` and we did not select this relation in our original query,
-peewee will have to perform an additional query to retrieve the pet's owner.
-This behavior is referred to as :ref:`N+1 <nplusone>` and it should generally
-be avoided.
+.. attention::
+    There is a big problem with the previous query: because we are accessing
+    ``pet.owner.name`` and we did not select this relation in our original
+    query, peewee will have to perform an additional query to retrieve the
+    pet's owner.  This behavior is referred to as :ref:`N+1 <nplusone>` and it
+    should generally be avoided.
+
+    For an in-depth guide to working with relationships and joins, refer to the
+    :ref:`relationships` documentation.
 
 We can avoid the extra queries by selecting both *Pet* and *Person*, and adding
 a *join*.
@@ -395,7 +397,7 @@ It would look like this:
     # Grandma L. no pets
     # Herb Mittens Jr
 
-Usually this type of duplication is undesirable. To accomodate the more common
+Usually this type of duplication is undesirable. To accommodate the more common
 (and intuitive) workflow of listing a person and attaching **a list** of that
 person's pets, we can use a special method called
 :py:meth:`~ModelSelect.prefetch`:
@@ -441,13 +443,6 @@ We're done with our database, let's close the connection:
     db.close()
 
 This is just the basics! You can make your queries as complex as you like.
-
-All the other SQL clauses are available as well, such as:
-
-* :py:meth:`~SelectQuery.group_by`
-* :py:meth:`~SelectQuery.having`
-* :py:meth:`~SelectQuery.limit` and :py:meth:`~SelectQuery.offset`
-
 Check the documentation on :ref:`querying` for more info.
 
 Working with existing databases

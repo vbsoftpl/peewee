@@ -11,7 +11,6 @@ to open a connection to a database, and then can be used to:
 * Execute queries.
 * Manage transactions (and savepoints).
 * Introspect tables, columns, indexes, and constraints.
-* Model integration
 
 Peewee comes with support for SQLite, MySQL and Postgres. Each database class
 provides some basic, database-specific configuration options.
@@ -21,9 +20,9 @@ provides some basic, database-specific configuration options.
     from peewee import *
 
     # SQLite database using WAL journal mode and 64MB cache.
-    sqlite_db = SqliteDatabase('/path/to/app.db', pragmas=(
-        ('journal_mode', 'wal'),
-        ('cache_size', -1024 * 64)))
+    sqlite_db = SqliteDatabase('/path/to/app.db', pragmas={
+        'journal_mode': 'wal',
+        'cache_size': -1024 * 64})
 
     # Connect to a MySQL database on network.
     mysql_db = MySQLDatabase('my_app', user='app', password='db_password',
@@ -43,7 +42,7 @@ database-specific module and use the database class provided:
 
     # Use SQLite (will register a REGEXP function and set busy timeout to 3s).
     db = SqliteExtDatabase('/path/to/app.db', regexp_function=True, timeout=3,
-                           pragmas=(('journal_mode', 'wal'),))
+                           pragmas={'journal_mode': 'wal'})
 
 
     from playhouse.postgres_ext import PostgresqlExtDatabase
@@ -56,7 +55,7 @@ For more information on database extensions, see:
 * :ref:`postgres_ext`
 * :ref:`sqlite_ext`
 * :ref:`sqlcipher_ext`
-* :ref:`apsw_ext`
+* :ref:`apsw`
 * :ref:`sqliteq`
 
 Initializing a Database
@@ -140,13 +139,13 @@ Using SQLite
 
 To connect to a SQLite database, we will use :py:class:`SqliteDatabase`. The
 first parameter is the filename containing the database, or the string
-*:memory:* to create an in-memory database. After the database filename, you
-can specify arbitrary `sqlite3 parameters
+``':memory:'`` to create an in-memory database. After the database filename,
+you can specify a list or pragmas or any other arbitrary `sqlite3 parameters
 <https://docs.python.org/2/library/sqlite3.html#sqlite3.connect>`_.
 
 .. code-block:: python
 
-    sqlite_db = SqliteDatabase('my_app.db')
+    sqlite_db = SqliteDatabase('my_app.db', pragmas={'journal_mode': 'wal'})
 
     class BaseModel(Model):
         """A base model that will use our Sqlite database."""
@@ -154,20 +153,23 @@ can specify arbitrary `sqlite3 parameters
             database = sqlite_db
 
     class User(BaseModel):
-        username = CharField()
+        username = TextField()
         # etc, etc
 
-The :ref:`playhouse` contains a :ref:`SQLite extension module <sqlite_ext>`
-which provides many SQLite-specific features such as :ref:`full-text search
-<sqlite_fts>`, json extension support, and much, much more. If you would like
-to use these awesome features, use the :py:class:`SqliteExtDatabase` from the
-``playhouse.sqlite_ext`` module:
+Peewee includes a :ref:`SQLite extension module <sqlite_ext>` which provides
+many SQLite-specific features such as :ref:`full-text search <sqlite-fts>`,
+:ref:`json extension support <sqlite-json1>`, and much, much more. If you would
+like to use these awesome features, use the :py:class:`SqliteExtDatabase` from
+the ``playhouse.sqlite_ext`` module:
 
 .. code-block:: python
 
     from playhouse.sqlite_ext import SqliteExtDatabase
 
-    sqlite_db = SqliteExtDatabase('my_app.db', journal_mode='WAL')
+    sqlite_db = SqliteExtDatabase('my_app.db', pragmas={
+        'journal_mode': 'wal',  # WAL-mode.
+        'cache_size': -64 * 1000,  # 64MB cache.
+        'synchronous': 0})  # Let the OS manage syncing.
 
 .. _sqlite-pragma:
 
@@ -175,18 +177,19 @@ PRAGMA statements
 ^^^^^^^^^^^^^^^^^
 
 SQLite allows run-time configuration of a number of parameters through
-``PRAGMA`` statements (`documentation <https://www.sqlite.org/pragma.html>`_).
-These statements are typically run against a new database connection. To run
-one or more ``PRAGMA`` statements against new connections, you can specify them
-as a list or tuple of 2-tuples containing the pragma name and value:
+``PRAGMA`` statements (`SQLite documentation <https://www.sqlite.org/pragma.html>`_).
+These statements are typically run when a new database connection is created.
+To run one or more ``PRAGMA`` statements against new connections, you can
+specify them as a dictionary or a list of 2-tuples containing the pragma name
+and value:
 
 .. code-block:: python
 
-    db = SqliteDatabase('my_app.db', pragmas=(
-        ('journal_mode', 'WAL'),
-        ('cache_size', 10000),
-        ('mmap_size', 1024 * 1024 * 32),
-    ))
+    db = SqliteDatabase('my_app.db', pragmas={
+        'journal_mode': 'wal',
+        'cache_size': 10000,  # 10000 pages, or ~40MB
+        'foreign_keys': 1,  # Enforce foreign-key constraints
+    })
 
 PRAGMAs may also be configured dynamically using either the
 :py:meth:`~SqliteDatabase.pragma` method or the special properties exposed on
@@ -194,7 +197,7 @@ the :py:class:`SqliteDatabase` object:
 
 .. code-block:: python
 
-    # Set cache size to 64MB for current connection.
+    # Set cache size to 64MB for *current connection*.
     db.pragma('cache_size', -1024 * 64)
 
     # Same as above.
@@ -214,6 +217,37 @@ the :py:class:`SqliteDatabase` object:
     Pragmas set using the :py:meth:`~SqliteDatabase.pragma` method, by default,
     do not persist after the connection is closed. To configure a pragma to be
     run whenever a connection is opened, specify ``permanent=True``.
+
+.. note::
+    A full list of PRAGMA settings, their meaning and accepted values can be
+    found in the SQLite documentation: http://sqlite.org/pragma.html
+
+Recommended Settings
+^^^^^^^^^^^^^^^^^^^^
+
+The following settings are what I use with SQLite for a typical web
+application database.
+
+========================= =================== ===============================================
+pragma                    recommended setting explanation
+========================= =================== ===============================================
+journal_mode              wal                 allow readers and writers to co-exist
+cache_size                -1 * data_size_kb   set page-cache size in KiB, e.g. -32000 = 32MB
+foreign_keys              1                   enforce foreign-key constraints
+ignore_check_constraints  0                   enforce CHECK constraints
+synchronous               0                   let OS handle fsync (use with caution)
+========================= =================== ===============================================
+
+Example database using the above options:
+
+.. code-block:: python
+
+    db = SqliteDatabase('my_app.db', pragmas={
+        'journal_mode': 'wal',
+        'cache_size': -1 * 64000,  # 64MB
+        'foreign_keys': 1,
+        'ignore_check_constraints': 0,
+        'synchronous': 0})
 
 .. _sqlite-user-functions:
 
@@ -455,7 +489,9 @@ web frameworks to manage database connections.
 Connecting using a Database URL
 -------------------------------
 
-The playhouse module :ref:`db_url` provides a helper :py:func:`connect` function that accepts a database URL and returns a :py:class:`Database` instance.
+The playhouse module :ref:`db_url` provides a helper :py:func:`connect`
+function that accepts a database URL and returns a :py:class:`Database`
+instance.
 
 Example code:
 
@@ -476,10 +512,10 @@ Example code:
 
 Example database URLs:
 
-* *sqlite:///my_database.db* will create a :py:class:`SqliteDatabase` instance for the file ``my_database.db`` in the current directory.
-* *sqlite:///:memory:* will create an in-memory :py:class:`SqliteDatabase` instance.
-* *postgresql://postgres:my_password@localhost:5432/my_database* will create a :py:class:`PostgresqlDatabase` instance. A username and password are provided, as well as the host and port to connect to.
-* *mysql://user:passwd@ip:port/my_db* will create a :py:class:`MySQLDatabase` instance for the local MySQL database *my_db*.
+* ``sqlite:///my_database.db`` will create a :py:class:`SqliteDatabase` instance for the file ``my_database.db`` in the current directory.
+* ``sqlite:///:memory:`` will create an in-memory :py:class:`SqliteDatabase` instance.
+* ``postgresql://postgres:my_password@localhost:5432/my_database`` will create a :py:class:`PostgresqlDatabase` instance. A username and password are provided, as well as the host and port to connect to.
+* ``mysql://user:passwd@ip:port/my_db`` will create a :py:class:`MySQLDatabase` instance for the local MySQL database *my_db*.
 * :ref:`More examples in the db_url documentation <db_url>`.
 
 .. _deferring_initialization:
@@ -494,7 +530,7 @@ these cases, you can *defer* the initialization of the database by specifying
 
 .. code-block:: python
 
-    database = SqliteDatabase(None)  # Un-initialized database.
+    database = PostgresqlDatabase(None)  # Un-initialized database.
 
     class SomeModel(Model):
         class Meta:
@@ -644,7 +680,7 @@ Thread Safety
 
 Peewee keeps track of the connection state using thread-local storage, making
 the Peewee :py:class:`Database` object safe to use with multiple threads. Each
-thread will have it's own connection, and conversely, any given thread will
+thread will have it's own connection, and as a result any given thread will
 only have a single connection open at a given time.
 
 Context managers
@@ -784,8 +820,7 @@ Example test-case setup:
         def setUp(self):
             # Bind model classes to test db. Since we have a complete list of
             # all models, we do not need to recursively bind dependencies.
-            for model in MODELS:
-                model.bind(test_db, bind_refs=False, bind_backrefs=False)
+            test_db.bind(MODELS, bind_refs=False, bind_backrefs=False)
 
             test_db.connect()
             test_db.create_tables(MODELS)
@@ -812,7 +847,7 @@ out Peewee's own `test-suite <https://github.com/coleifer/peewee/tree/master/tes
 Async with Gevent
 -----------------
 
-`gevent <http://www.gevent.org/>` is recommended for doing asynchronous i/o
+`gevent <http://www.gevent.org/>`_ is recommended for doing asynchronous I/O
 with Postgresql or MySQL. Reasons I prefer gevent:
 
 * No need for special-purpose "loop-aware" re-implementations of *everything*.
@@ -820,7 +855,7 @@ with Postgresql or MySQL. Reasons I prefer gevent:
   layers of code as well as re-implementing the protocols themselves.
 * Gevent allows you to write your application in normal, clean, idiomatic
   Python. No need to litter every line with "async", "await" and other noise.
-  No callbacks. No cruft.
+  No callbacks, futures, tasks, promises. No cruft.
 * Gevent works with both Python 2 *and* Python 3.
 * Gevent is *Pythonic*. Asyncio is an un-pythonic abomination.
 
@@ -1173,6 +1208,8 @@ execute SQL directly, you can use the :py:meth:`Database.execute_sql` method.
         # Do something with row, which is a tuple containing column data.
         pass
 
+.. _transactions:
+
 Managing Transactions
 ---------------------
 
@@ -1409,15 +1446,18 @@ The Python DB-API 2.0 spec describes `several types of exceptions <https://www.p
 Logging queries
 ---------------
 
-All queries are logged to the *peewee* namespace using the standard library ``logging`` module. Queries are logged using the *DEBUG* level.  If you're interested in doing something with the queries, you can simply register a handler.
+All queries are logged to the *peewee* namespace using the standard library
+``logging`` module. Queries are logged using the *DEBUG* level.  If you're
+interested in doing something with the queries, you can simply register a
+handler.
 
 .. code-block:: python
 
     # Print all queries to stderr.
     import logging
     logger = logging.getLogger('peewee')
-    logger.setLevel(logging.DEBUG)
     logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.DEBUG)
 
 Adding a new Database Driver
 ----------------------------
@@ -1429,7 +1469,7 @@ there are a ton of cool databases out there and adding support for your
 database-of-choice should be really easy, provided the driver supports the
 `DB-API 2.0 spec <http://www.python.org/dev/peps/pep-0249/>`_.
 
-The db-api 2.0 spec should be familiar to you if you've used the standard
+The DB-API 2.0 spec should be familiar to you if you've used the standard
 library sqlite3 driver, psycopg2 or the like. Peewee currently relies on a
 handful of parts:
 
@@ -1478,8 +1518,11 @@ has special "SHOW" statements:
 Other things the database handles that are not covered here include:
 
 * :py:meth:`~Database.last_insert_id` and :py:meth:`~Database.rows_affected`
-* :py:attr:`~Database.interpolation` and :py:attr:`~Database.quote_char`
-* :py:attr:`~Database.op_overrides` for mapping operations such as "LIKE/ILIKE" to their database equivalent
+* :py:attr:`~Database.param` and :py:attr:`~Database.quote`, which tell the
+  SQL-generating code how to add parameter placeholders and quote entity names.
+* :py:attr:`~Database.field_types` for mapping data-types like INT or TEXT to
+  their vendor-specific type names.
+* :py:attr:`~Database.operations` for mapping operations such as "LIKE/ILIKE" to their database equivalent
 
 Refer to the :py:class:`Database` API reference or the `source code
 <https://github.com/coleifer/peewee/blob/master/peewee.py>`_. for details.

@@ -60,12 +60,7 @@ Execution context examples (using above `db` instance):
 """
 import heapq
 import logging
-import threading
 import time
-try:
-    from Queue import Queue
-except ImportError:
-    from queue import Queue
 
 try:
     from psycopg2 import extensions as pg_extensions
@@ -100,11 +95,6 @@ class PooledDatabase(object):
         self._connections = []
         self._in_use = {}
         self.conn_key = id
-
-        if self._wait_timeout:
-            self._event = threading.Event()
-            self._ready_queue = Queue()
-
         super(PooledDatabase, self).__init__(database, **kwargs)
 
     def init(self, database, max_connections=None, stale_timeout=None,
@@ -120,19 +110,19 @@ class PooledDatabase(object):
                 self._wait_timeout = float('inf')
 
     def connect(self, reuse_if_open=False):
-        if self._wait_timeout:
-            expires = time.time() + self._wait_timeout
-            while expires > time.time():
-                try:
-                    super(PooledDatabase, self).connect()
-                except MaxConnectionsExceeded:
-                    time.sleep(0.1)
-                else:
-                    return
-            raise MaxConnectionsExceeded('Max connections exceeded, timed out '
-                                         'attempting to connect.')
-        else:
-            super(PooledDatabase, self).connect()
+        if not self._wait_timeout:
+            return super(PooledDatabase, self).connect(reuse_if_open)
+
+        expires = time.time() + self._wait_timeout
+        while expires > time.time():
+            try:
+                ret = super(PooledDatabase, self).connect(reuse_if_open)
+            except MaxConnectionsExceeded:
+                time.sleep(0.1)
+            else:
+                return ret
+        raise MaxConnectionsExceeded('Max connections exceeded, timed out '
+                                     'attempting to connect.')
 
     def _connect(self):
         while True:

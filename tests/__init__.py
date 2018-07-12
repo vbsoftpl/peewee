@@ -5,13 +5,15 @@ from peewee import OperationalError
 
 # Core modules.
 from .database import *
+from .expressions import *
 from .fields import *
 from .keys import *
 from .manytomany import *
 from .models import *
 from .model_sql import *
-from .prefetch import *
+from .prefetch_tests import *
 from .queries import *
+from .regressions import *
 from .results import *
 from .schema import *
 from .sql import *
@@ -32,6 +34,11 @@ from .extra_fields import *
 from .hybrid import *
 from .kv import *
 from .migrations import *
+try:
+    import mysql.connector
+    from .mysql_ext import *
+except ImportError:
+    print('Unable to import mysql-connector, skipping mysql_ext tests.')
 from .pool import *
 try:
     from .postgres import *

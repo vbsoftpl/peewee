@@ -1,10 +1,11 @@
 from peewee import *
 
 from .base import IS_MYSQL
+from .base import IS_SQLITE
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db
-from .base import skip_unless
+from .base import requires_sqlite
 
 
 class Package(TestModel):
@@ -258,7 +259,7 @@ class TestCompositePrimaryKey(ModelTestCase):
 
     def test_create_table_query(self):
         query, params = TagPostThrough._schema._create_table().query()
-        sql = ('CREATE TABLE IF NOT EXISTS "tagpostthrough" ('
+        sql = ('CREATE TABLE IF NOT EXISTS "tag_post_through" ('
                '"tag_id" INTEGER NOT NULL, '
                '"post_id" INTEGER NOT NULL, '
                'PRIMARY KEY ("tag_id", "post_id"), '
@@ -413,9 +414,8 @@ class TestForeignKeyConstraints(ModelTestCase):
         super(TestForeignKeyConstraints, self).tearDown()
 
     def set_foreign_key_pragma(self, is_enabled):
-        if not isinstance(self.database, SqliteDatabase):
-            return
-        self.database.foreign_keys = 'on' if is_enabled else 'off'
+        if IS_SQLITE:
+            self.database.foreign_keys = 'on' if is_enabled else 'off'
 
     def test_constraint_exists(self):
         max_id = User.select(fn.MAX(User.id)).scalar() or 0
@@ -423,7 +423,7 @@ class TestForeignKeyConstraints(ModelTestCase):
             with self.database.atomic():
                 Note.create(user=max_id + 1, content='test')
 
-    @skip_unless(isinstance(db, SqliteDatabase))
+    @requires_sqlite
     def test_disable_constraint(self):
         self.set_foreign_key_pragma(False)
         Note.create(user=0, content='test')

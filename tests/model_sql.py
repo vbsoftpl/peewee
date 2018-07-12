@@ -368,8 +368,42 @@ class TestModelSQL(ModelDatabaseTestCase):
             'UPDATE "account" SET '
             '"contact_first" = "first", '
             '"contact_last" = "last" '
-            'FROM "salesperson" '
+            'FROM "sales_person" AS "t1" '
             'WHERE ("sales_id" = "id")'), [])
+
+        query = (User
+                 .update({User.username: QualifiedNames(Tweet.content)})
+                 .from_(Tweet)
+                 .where(Tweet.content == 'tx'))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = "t1"."content" '
+            'FROM "tweet" AS "t1" WHERE ("content" = ?)'), ['tx'])
+
+    def test_update_from_qualnames(self):
+        data = [(1, 'u1-x'), (2, 'u2-x')]
+        vl = ValuesList(data, columns=('id', 'username'), alias='tmp')
+        query = (User
+                 .update({User.username: QualifiedNames(vl.c.username)})
+                 .from_(vl)
+                 .where(QualifiedNames(User.id == vl.c.id)))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = "tmp"."username" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "tmp"("id", "username") '
+            'WHERE ("users"."id" = "tmp"."id")'), [1, 'u1-x', 2, 'u2-x'])
+
+    def test_update_from_subselect(self):
+        data = [(1, 'u1-x'), (2, 'u2-x')]
+        vl = ValuesList(data, columns=('id', 'username'), alias='tmp')
+        subq = vl.select(vl.c.id, vl.c.username)
+        query = (User
+                 .update({User.username: QualifiedNames(subq.c.username)})
+                 .from_(subq)
+                 .where(QualifiedNames(User.id == subq.c.id)))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "username" = "t1"."username" FROM ('
+            'SELECT "tmp"."id", "tmp"."username" '
+            'FROM (VALUES (?, ?), (?, ?)) AS "tmp"("id", "username")) AS "t1" '
+            'WHERE ("users"."id" = "t1"."id")'), [1, 'u1-x', 2, 'u2-x'])
 
     def test_delete(self):
         query = (Note
@@ -408,24 +442,11 @@ class TestModelSQL(ModelDatabaseTestCase):
             ('DELETE FROM "like" WHERE ('
              '"tweet_id" IN ('
              'SELECT "t1"."id" FROM "tweet" AS "t1" WHERE ('
-             '"t1"."user_id" IN ('
-             'SELECT "t2"."id" FROM "user" AS "t2" WHERE ("t2"."id" = ?)))))',
-             [1]),
-            ('DELETE FROM "like" WHERE ("user_id" IN ('
-             'SELECT "t1"."id" FROM "user" AS "t1" WHERE ("t1"."id" = ?)))',
-             [1]),
-            ('DELETE FROM "relationship" WHERE ('
-             '"from_user_id" IN ('
-             'SELECT "t1"."id" FROM "user" AS "t1" WHERE ("t1"."id" = ?)))',
-             [1]),
-            ('DELETE FROM "relationship" WHERE ('
-             '"to_user_id" IN ('
-             'SELECT "t1"."id" FROM "user" AS "t1" WHERE ("t1"."id" = ?)))',
-             [1]),
-            ('DELETE FROM "tweet" WHERE ('
-             '"user_id" IN ('
-             'SELECT "t1"."id" FROM "user" AS "t1" WHERE ("t1"."id" = ?)))',
-             [1]),
+             '"t1"."user_id" = ?)))', [1]),
+            ('DELETE FROM "like" WHERE ("user_id" = ?)', [1]),
+            ('DELETE FROM "relationship" WHERE ("from_user_id" = ?)', [1]),
+            ('DELETE FROM "relationship" WHERE ("to_user_id" = ?)', [1]),
+            ('DELETE FROM "tweet" WHERE ("user_id" = ?)', [1]),
         ])
 
     def test_aliases(self):
@@ -468,7 +489,7 @@ class TestModelSQL(ModelDatabaseTestCase):
         query = WithSchema.select().where(WithSchema.data == 'zaizee')
         self.assertSQL(query, (
             'SELECT "t1"."data" '
-            'FROM "huey"."withschema" AS "t1" '
+            'FROM "huey"."with_schema" AS "t1" '
             'WHERE ("t1"."data" = ?)'), ['zaizee'])
 
 
@@ -594,9 +615,9 @@ class TestModelCompoundSelect(BaseTestCase):
         # This may be invalid SQL, but this at least documents the behavior.
         self.assertSQL(compound, (
             'SELECT "t1"."alpha" FROM "alpha" AS "t1" '
-            'ORDER BY "t1"."alpha" LIMIT 3 UNION '
+            'ORDER BY "t1"."alpha" LIMIT ? UNION '
             'SELECT "t2"."beta" FROM "beta" AS "t2" '
-            'ORDER BY "t2"."beta" LIMIT 4 LIMIT 5'), [])
+            'ORDER BY "t2"."beta" LIMIT ? LIMIT ?'), [3, 4, 5])
 
     def test_union_from(self):
         lhs = Alpha.select(Alpha.alpha).where(Alpha.alpha < 2)
