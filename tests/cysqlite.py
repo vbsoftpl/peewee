@@ -1,12 +1,15 @@
 import os
 
 from peewee import *
+from peewee import sqlite3
 from playhouse.sqlite_ext import CYTHON_SQLITE_EXTENSIONS
 from playhouse.sqlite_ext import *
 from playhouse._sqlite_ext import BloomFilter
 
 from .base import BaseTestCase
 from .base import DatabaseTestCase
+from .base import db_loader
+from .base import skip_unless
 
 
 database = CSqliteExtDatabase('peewee_test.db', timeout=100,
@@ -357,9 +360,9 @@ class TestBloomFilterIntegration(CyDatabaseTestCase):
         all_keys = self.populate()
 
         curs = self.execute('select bloomfilter(data, ?) from register',
-                            1024 * 16)
+                            1024 * 128)
         buf, = curs.fetchone()
-        self.assertEqual(len(buf), 1024 * 16)
+        self.assertEqual(len(buf), 1024 * 128)
         for key in all_keys:
             curs = self.execute('select bloomfilter_contains(?, ?)',
                                 key, buf)
@@ -388,3 +391,45 @@ class TestBloomFilter(BaseTestCase):
             self.assertFalse(key + '-x' in self.bf)
             self.assertFalse(key + '-y' in self.bf)
             self.assertFalse(key + ' ' in self.bf)
+
+
+class DataTypes(TableFunction):
+    columns = ('key', 'value')
+    params = ()
+    name = 'data_types'
+
+    def initialize(self):
+        self.values = (
+            None,
+            1,
+            2.,
+            u'unicode str',
+            b'byte str',
+            False,
+            True)
+        self.idx = 0
+        self.n = len(self.values)
+
+    def iterate(self, idx):
+        if idx < self.n:
+            return ('k%s' % idx, self.values[idx])
+        raise StopIteration
+
+
+@skip_unless(sqlite3.sqlite_version_info >= (3, 9), 'requires sqlite >= 3.9')
+class TestDataTypesTableFunction(CyDatabaseTestCase):
+    database = db_loader('sqlite')
+
+    def test_data_types_table_function(self):
+        self.database.register_table_function(DataTypes)
+        cursor = self.database.execute_sql('SELECT key, value '
+                                           'FROM data_types() ORDER BY key')
+        self.assertEqual(cursor.fetchall(), [
+            ('k0', None),
+            ('k1', 1),
+            ('k2', 2.),
+            ('k3', u'unicode str'),
+            ('k4', b'byte str'),
+            ('k5', 0),
+            ('k6', 1),
+        ])

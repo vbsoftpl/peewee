@@ -3,6 +3,7 @@ try:
     from Queue import Queue
 except ImportError:
     from queue import Queue
+import re
 import threading
 
 from peewee import *
@@ -13,6 +14,9 @@ from peewee import sort_models
 
 from .base import BaseTestCase
 from .base import DatabaseTestCase
+from .base import IS_MYSQL
+from .base import IS_POSTGRESQL
+from .base import IS_SQLITE
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db
@@ -143,6 +147,24 @@ class TestDatabase(DatabaseTestCase):
         conn = self.database.connection()
         self.assertFalse(self.database.is_closed())
 
+    def test_db_context_manager(self):
+        self.database.close()
+        self.assertTrue(self.database.is_closed())
+
+        with self.database:
+            self.assertFalse(self.database.is_closed())
+
+        self.assertTrue(self.database.is_closed())
+        self.database.connect()
+        self.assertFalse(self.database.is_closed())
+
+        # Enter context with an already-open db.
+        with self.database:
+            self.assertFalse(self.database.is_closed())
+
+        # Closed after exit.
+        self.assertTrue(self.database.is_closed())
+
     def test_connection_initialization(self):
         state = {'count': 0}
         class TestDatabase(SqliteDatabase):
@@ -248,6 +270,35 @@ class TestDatabase(DatabaseTestCase):
         assertBatches(12, 11, 2)
         assertBatches(12, 12, 1)
         assertBatches(12, 13, 1)
+
+    def test_server_version(self):
+        class FakeDatabase(Database):
+            server_version = None
+            def _connect(self):
+                return 1
+            def _close(self, conn):
+                pass
+            def _set_server_version(self, conn):
+                self.server_version = (1, 33, 7)
+
+        db = FakeDatabase(':memory:')
+        self.assertTrue(db.server_version is None)
+        db.connect()
+        self.assertEqual(db.server_version, (1, 33, 7))
+        db.close()
+        self.assertEqual(db.server_version, (1, 33, 7))
+
+        db.server_version = (1, 2, 3)
+        db.connect()
+        self.assertEqual(db.server_version, (1, 2, 3))
+        db.close()
+
+    def test_explicit_connect(self):
+        db = get_in_memory_db(autoconnect=False)
+        self.assertRaises(InterfaceError, db.execute_sql, 'pragma cache_size')
+        with db:
+            db.execute_sql('pragma cache_size')
+        self.assertRaises(InterfaceError, db.cursor)
 
 
 class TestThreadSafety(ModelTestCase):
@@ -391,6 +442,15 @@ class IndexedModel(TestModel):
         )
 
 
+class Note(TestModel):
+    content = TextField()
+    ts = DateTimeField()
+    status = IntegerField()
+
+    class Meta:
+        table_name = 'notes'
+
+
 class TestIntrospection(ModelTestCase):
     requires = [Category, User, UniqueModel, IndexedModel]
 
@@ -449,6 +509,65 @@ class TestIntrospection(ModelTestCase):
         primary_keys = self.database.get_primary_keys('category')
         self.assertEqual(primary_keys, ['name'])
 
+    @requires_models(Note)
+    def test_get_views(self):
+        def normalize_view_meta(view_meta):
+            sql_ws_norm = re.sub('\n\s+', ' ', view_meta.sql)
+            return view_meta.name, (sql_ws_norm
+                                    .replace('`peewee_test`.', '')
+                                    .replace('`notes`.', '')
+                                    .replace('`', ''))
+
+        def assertViews(expected):
+            # Create two sample views.
+            self.database.execute_sql('CREATE VIEW notes_public AS '
+                                      'SELECT content, ts FROM notes '
+                                      'WHERE status = 1 ORDER BY ts DESC')
+            self.database.execute_sql('CREATE VIEW notes_deleted AS '
+                                      'SELECT content FROM notes '
+                                      'WHERE status = 9 ORDER BY id DESC')
+            try:
+                views = self.database.get_views()
+                normalized = sorted([normalize_view_meta(v) for v in views])
+                self.assertEqual(normalized, expected)
+
+                # Ensure that we can use get_columns to introspect views.
+                columns = self.database.get_columns('notes_deleted')
+                self.assertEqual([c.name for c in columns], ['content'])
+
+                columns = self.database.get_columns('notes_public')
+                self.assertEqual([c.name for c in columns], ['content', 'ts'])
+            finally:
+                self.database.execute_sql('DROP VIEW notes_public;')
+                self.database.execute_sql('DROP VIEW notes_deleted;')
+
+        # Unfortunately, all databases seem to represent VIEW definitions
+        # differently internally.
+        if IS_SQLITE:
+            assertViews([
+                ('notes_deleted', ('CREATE VIEW notes_deleted AS '
+                                   'SELECT content FROM notes '
+                                   'WHERE status = 9 ORDER BY id DESC')),
+                ('notes_public', ('CREATE VIEW notes_public AS '
+                                  'SELECT content, ts FROM notes '
+                                  'WHERE status = 1 ORDER BY ts DESC'))])
+        elif IS_MYSQL:
+            assertViews([
+                ('notes_deleted',
+                 ('select content AS content from notes '
+                  'where status = 9 order by id desc')),
+                ('notes_public',
+                 ('select content AS content,ts AS ts from notes '
+                  'where status = 1 order by ts desc'))])
+        elif IS_POSTGRESQL:
+            assertViews([
+                ('notes_deleted',
+                 ('SELECT notes.content FROM notes '
+                  'WHERE (notes.status = 9) ORDER BY notes.id DESC;')),
+                ('notes_public',
+                 ('SELECT notes.content, notes.ts FROM notes '
+                  'WHERE (notes.status = 1) ORDER BY notes.ts DESC;'))])
+
     @requires_models(User, Tweet, Category)
     def test_get_foreign_keys(self):
         foreign_keys = self.database.get_foreign_keys('tweet')
@@ -484,6 +603,23 @@ class TestSortModels(BaseTestCase):
 
 
 class TestDBProxy(BaseTestCase):
+    def test_proxy_context_manager(self):
+        db = Proxy()
+        class User(Model):
+            username = TextField()
+
+            class Meta:
+                database = db
+
+        self.assertRaises(AttributeError, User.create_table)
+
+        sqlite_db = SqliteDatabase(':memory:')
+        db.initialize(sqlite_db)
+        User.create_table()
+        with db:
+            self.assertFalse(db.is_closed())
+        self.assertTrue(db.is_closed())
+
     def test_db_proxy(self):
         db = Proxy()
         class BaseModel(Model):
@@ -509,6 +645,29 @@ class TestDBProxy(BaseTestCase):
         self.assertFalse(User._meta.database.is_closed())
         self.assertFalse(Tweet._meta.database.is_closed())
         sqlite_db.close()
+
+    def test_proxy_decorator(self):
+        db = DatabaseProxy()
+
+        @db.connection_context()
+        def with_connection():
+            self.assertFalse(db.is_closed())
+
+        @db.atomic()
+        def with_transaction():
+            self.assertTrue(db.in_transaction())
+
+        @db.manual_commit()
+        def with_manual_commit():
+            self.assertTrue(db.in_transaction())
+
+        db.initialize(SqliteDatabase(':memory:'))
+        with_connection()
+        self.assertTrue(db.is_closed())
+        with_transaction()
+        self.assertFalse(db.in_transaction())
+        with_manual_commit()
+        self.assertFalse(db.in_transaction())
 
 
 class Data(TestModel):
@@ -617,3 +776,33 @@ class TestAttachDatabase(ModelTestCase):
 
         tables = self.database.get_tables(schema='cache')
         self.assertEqual(tables, ['cache_data'])
+
+
+class TestDatabaseConnection(DatabaseTestCase):
+    def test_is_connection_usable(self):
+        # Ensure a connection is open.
+        conn = self.database.connection()
+        self.assertTrue(self.database.is_connection_usable())
+
+        self.database.close()
+        self.assertFalse(self.database.is_connection_usable())
+        self.database.connect()
+        self.assertTrue(self.database.is_connection_usable())
+
+    @requires_postgresql
+    def test_is_connection_usable_pg(self):
+        self.database.execute_sql('drop table if exists foo')
+        self.database.execute_sql('create table foo (data text not null)')
+        self.assertTrue(self.database.is_connection_usable())
+
+        with self.assertRaises(IntegrityError):
+            self.database.execute_sql('insert into foo (data) values (NULL)')
+
+        self.assertFalse(self.database.is_closed())
+        self.assertFalse(self.database.is_connection_usable())
+        self.database.rollback()
+        self.assertTrue(self.database.is_connection_usable())
+
+        curs = self.database.execute_sql('select * from foo')
+        self.assertEqual(list(curs), [])
+        self.database.execute_sql('drop table foo')

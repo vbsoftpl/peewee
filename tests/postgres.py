@@ -1,5 +1,6 @@
 #coding:utf-8
 import datetime
+import uuid
 from decimal import Decimal as Dc
 from types import MethodType
 
@@ -7,6 +8,7 @@ from peewee import *
 from playhouse.postgres_ext import *
 
 from .base import BaseTestCase
+from .base import DatabaseTestCase
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db_loader
@@ -27,6 +29,12 @@ D = HStoreModel.data
 class ArrayModel(TestModel):
     tags = ArrayField(CharField)
     ints = ArrayField(IntegerField, dimensions=2)
+
+
+class UUIDList(TestModel):
+    key = CharField()
+    id_list = ArrayField(BinaryUUIDField, convert_values=True, index=False)
+    id_list_native = ArrayField(UUIDField, index=False)
 
 
 class ArrayTSModel(TestModel):
@@ -78,13 +86,51 @@ class TestTZField(ModelTestCase):
     requires = [TZModel]
 
     def test_tz_field(self):
-        self.database.execute_sql('set time zone "us/central";')
+        self.database.set_time_zone('us/eastern')
 
-        dt = datetime.datetime.now()
+        # Our naive datetime is treated as if it were in US/Eastern.
+        dt = datetime.datetime(2019, 1, 1, 12)
         tz = TZModel.create(dt=dt)
         self.assertTrue(tz.dt.tzinfo is None)
 
-        tz = TZModel.get(TZModel.id == tz.id)
+        # When we retrieve the row, psycopg2 will attach the appropriate tzinfo
+        # data. The value is returned as an "aware" datetime in US/Eastern.
+        tz_db = TZModel[tz.id]
+        self.assertTrue(tz_db.dt.tzinfo is not None)
+        self.assertEqual(tz_db.dt.timetuple()[:4], (2019, 1, 1, 12))
+        self.assertEqual(tz_db.dt.utctimetuple()[:4], (2019, 1, 1, 17))
+
+        class _UTC(datetime.tzinfo):
+            def utcoffset(self, dt): return datetime.timedelta(0)
+            def tzname(self, dt): return "UTC"
+            def dst(self, dt): return datetime.timedelta(0)
+        UTC = _UTC()
+
+        # We can explicitly insert a row with a different timezone, however.
+        # When we read the row back, it is returned in US/Eastern.
+        dt2 = datetime.datetime(2019, 1, 1, 12, tzinfo=UTC)
+        tz2 = TZModel.create(dt=dt2)
+        tz2_db = TZModel[tz2.id]
+        self.assertEqual(tz2_db.dt.timetuple()[:4], (2019, 1, 1, 7))
+        self.assertEqual(tz2_db.dt.utctimetuple()[:4], (2019, 1, 1, 12))
+
+        # Querying using naive datetime, treated as localtime (US/Eastern).
+        tzq1 = TZModel.get(TZModel.dt == dt)
+        self.assertEqual(tzq1.id, tz.id)
+
+        # Querying using aware datetime, tzinfo is respected.
+        tzq2 = TZModel.get(TZModel.dt == dt2)
+        self.assertEqual(tzq2.id, tz2.id)
+
+        # Change the connection timezone?
+        self.database.set_time_zone('us/central')
+        tz_db = TZModel[tz.id]
+        self.assertEqual(tz_db.dt.timetuple()[:4], (2019, 1, 1, 11))
+        self.assertEqual(tz_db.dt.utctimetuple()[:4], (2019, 1, 1, 17))
+
+        tz2_db = TZModel[tz2.id]
+        self.assertEqual(tz2_db.dt.timetuple()[:4], (2019, 1, 1, 6))
+        self.assertEqual(tz2_db.dt.utctimetuple()[:4], (2019, 1, 1, 12))
 
 
 class TestHStoreField(ModelTestCase):
@@ -327,14 +373,15 @@ class TestArrayFieldConvertValues(ModelTestCase):
     database = db
     requires = [ArrayTSModel]
 
+    def dt(self, day, hour=0, minute=0, second=0):
+        return datetime.datetime(2018, 1, day, hour, minute, second)
+
     def test_value_conversion(self):
-        def dt(day, hour=0, minute=0, second=0):
-            return datetime.datetime(2018, 1, day, hour, minute, second)
 
         data = {
-            'k1': [dt(1), dt(2), dt(3)],
+            'k1': [self.dt(1), self.dt(2), self.dt(3)],
             'k2': [],
-            'k3': [dt(4, 5, 6, 7), dt(10, 11, 12, 13)],
+            'k3': [self.dt(4, 5, 6, 7), self.dt(10, 11, 12, 13)],
         }
         for key in sorted(data):
             ArrayTSModel.create(key=key, timestamps=data[key])
@@ -344,14 +391,62 @@ class TestArrayFieldConvertValues(ModelTestCase):
             self.assertEqual(am.timestamps, data[key])
 
         # Perform lookup using timestamp values.
-        ts = ArrayTSModel.get(ArrayTSModel.timestamps.contains(dt(3)))
+        ts = ArrayTSModel.get(ArrayTSModel.timestamps.contains(self.dt(3)))
         self.assertEqual(ts.key, 'k1')
 
-        ts = ArrayTSModel.get(ArrayTSModel.timestamps.contains(dt(4, 5, 6, 7)))
+        ts = ArrayTSModel.get(
+            ArrayTSModel.timestamps.contains(self.dt(4, 5, 6, 7)))
         self.assertEqual(ts.key, 'k3')
 
         self.assertRaises(ArrayTSModel.DoesNotExist, ArrayTSModel.get,
-                          ArrayTSModel.timestamps.contains(dt(4, 5, 6)))
+                          ArrayTSModel.timestamps.contains(self.dt(4, 5, 6)))
+
+    def test_get_with_array_values(self):
+        a1 = ArrayTSModel.create(key='k1', timestamps=[self.dt(1)])
+        a2 = ArrayTSModel.create(key='k2', timestamps=[self.dt(2), self.dt(3)])
+
+        query = (ArrayTSModel
+                 .select()
+                 .where(ArrayTSModel.timestamps == [self.dt(1)]))
+        a1_db = query.get()
+        self.assertEqual(a1_db.id, a1.id)
+
+        query = (ArrayTSModel
+                 .select()
+                 .where(ArrayTSModel.timestamps == [self.dt(2), self.dt(3)]))
+        a2_db = query.get()
+        self.assertEqual(a2_db.id, a2.id)
+
+        a1_db = ArrayTSModel.get(timestamps=[self.dt(1)])
+        self.assertEqual(a1_db.id, a1.id)
+
+        a2_db = ArrayTSModel.get(timestamps=[self.dt(2), self.dt(3)])
+        self.assertEqual(a2_db.id, a2.id)
+
+
+class TestArrayUUIDField(ModelTestCase):
+    database = db
+    requires = [UUIDList]
+
+    def setUp(self):
+        super(TestArrayUUIDField, self).setUp()
+        import psycopg2.extras
+        psycopg2.extras.register_uuid()
+
+    def test_array_of_uuids(self):
+        u1, u2, u3, u4 = [uuid.uuid4() for _ in range(4)]
+        a = UUIDList.create(key='a', id_list=[u1, u2, u3],
+                            id_list_native=[u1, u2, u3])
+        b = UUIDList.create(key='b', id_list=[u2, u3, u4],
+                            id_list_native=[u2, u3, u4])
+        a_db = UUIDList.get(UUIDList.key == 'a')
+        b_db = UUIDList.get(UUIDList.key == 'b')
+
+        self.assertEqual(a.id_list, [u1, u2, u3])
+        self.assertEqual(b.id_list, [u2, u3, u4])
+
+        self.assertEqual(a.id_list_native, [u1, u2, u3])
+        self.assertEqual(b.id_list_native, [u2, u3, u4])
 
 
 class TestTSVectorField(ModelTestCase):
@@ -404,6 +499,13 @@ class TestTSVectorField(ModelTestCase):
         self.assertMessages(M('faith & things'), [2, 4])
         self.assertMessages(M('god | things'), [1, 2, 4])
         self.assertMessages(M('god & things'), [])
+
+        # Using the plain parser we cannot express "OR", but individual term
+        # match works like we expect and multi-term is AND-ed together.
+        self.assertMessages(M('god | things', plain=True), [])
+        self.assertMessages(M('god', plain=True), [1])
+        self.assertMessages(M('thing', plain=True), [2, 4])
+        self.assertMessages(M('faith things', plain=True), [2, 4])
 
 
 class BaseJsonFieldTestCase(object):
@@ -515,7 +617,8 @@ class BaseJsonFieldTestCase(object):
         table = self.M._meta.table_name
         self.assertSQL(j, (
             'SELECT "t1"."id", "t1"."data" '
-            'FROM "%s" AS "t1" WHERE ("t1"."data" = ?)') % table)
+            'FROM "%s" AS "t1" WHERE ("t1"."data" = CAST(? AS %s))')
+            % (table, self.M.data._json_datatype))
 
         j = (self.M
              .select()
@@ -551,10 +654,30 @@ class BaseJsonFieldTestCase(object):
 
         self.assertItems((self.M.data['k2']['xxx'] == 'v1'))
 
+    def test_json_bulk_update_top_level_list(self):
+        m1 = self.M.create(data=['a', 'b', 'c'])
+        m2 = self.M.create(data=['d', 'e', 'f'])
+
+        m1.data = ['g', 'h', 'i']
+        m2.data = ['j', 'k', 'l']
+        self.M.bulk_update([m1, m2], fields=[self.M.data])
+        m1_db = self.M.get(self.M.id == m1.id)
+        m2_db = self.M.get(self.M.id == m2.id)
+        self.assertEqual(m1_db.data, ['g', 'h', 'i'])
+        self.assertEqual(m2_db.data, ['j', 'k', 'l'])
+
 
 def pg93():
     with db:
         return db.connection().server_version >= 90300
+
+def pg10():
+    with db:
+        return db.connection().server_version >= 100000
+
+def pg12():
+    with db:
+        return db.connection().server_version >= 120000
 
 JSON_SUPPORT = (JsonModel is not None) and pg93()
 
@@ -698,6 +821,75 @@ class TestBinaryJsonField(BaseJsonFieldTestCase, ModelTestCase):
         self.assertObjects(D.contains_all('k1', 'k2', 'k3'), 0)
         self.assertObjects(D.contains_all('k1', 'k2', 'k3', 'k4'))
 
+        # Has key.
+        self.assertObjects(D.has_key('a1'), 1, 2)
+        self.assertObjects(D.has_key('k1'), 0, 5)
+        self.assertObjects(D.has_key('k4'), 2, 5)
+        self.assertObjects(D.has_key('a3'))
+
+        self.assertObjects(D['k3'].has_key('k4'), 0)
+        self.assertObjects(D['k4'].has_key('i2'), 2)
+
+    @skip_unless(pg10(), 'jsonb remove support requires pg >= 10')
+    def test_remove_data(self):
+        BJson.delete().execute()  # Clear out db.
+        BJson.create(data={
+            'k1': 'v1',
+            'k2': 'v2',
+            'k3': {'x1': 'z1', 'x2': 'z2'},
+            'k4': [0, 1, 2]})
+
+        def assertData(exp_list, expected_data):
+            query = BJson.select(BJson.data.remove(*exp_list)).tuples()
+            data = query[:][0][0]
+            self.assertEqual(data, expected_data)
+
+        D = BJson.data
+        assertData(['k3'], {'k1': 'v1', 'k2': 'v2', 'k4': [0, 1, 2]})
+        assertData(['k1', 'k3'], {'k2': 'v2', 'k4': [0, 1, 2]})
+        assertData(['k1', 'kx', 'ky', 'k3'], {'k2': 'v2', 'k4': [0, 1, 2]})
+        assertData(['k4', 'k3'], {'k1': 'v1', 'k2': 'v2'})
+
+    def test_concat_data(self):
+        BJson.delete().execute()
+        BJson.create(data={'k1': {'x1': 'y1'}, 'k2': 'v2', 'k3': [0, 1]})
+
+        def assertData(exp, expected_data):
+            query = BJson.select(BJson.data.concat(exp)).tuples()
+            data = query[:][0][0]
+            self.assertEqual(data, expected_data)
+
+        D = BJson.data
+        assertData({'k2': 'v2-x', 'k1': {'x2': 'y2'}, 'k4': 'v4'}, {
+            'k1': {'x2': 'y2'},  # NB: not merged/patched!!
+            'k2': 'v2-x',
+            'k3': [0, 1],
+            'k4': 'v4'})
+        assertData({'k1': 'v1-x', 'k3': [2, 3, 4], 'k4': {'x4': 'y4'}}, {
+            'k1': 'v1-x',
+            'k2': 'v2',
+            'k3': [2, 3, 4],
+            'k4': {'x4': 'y4'}})
+
+        # We can update sub-keys.
+        query = BJson.select(BJson.data['k1'].concat({'x2': 'y2', 'x3': 'y3'}))
+        self.assertEqual(query.tuples()[0][0],
+                         {'x1': 'y1', 'x2': 'y2', 'x3': 'y3'})
+
+        # Concat can be used to extend JSON arrays.
+        query = BJson.select(BJson.data['k3'].concat([2, 3]))
+        self.assertEqual(query.tuples()[0][0], [0, 1, 2, 3])
+
+    def test_update_data_inplace(self):
+        BJson.delete().execute()
+        b = BJson.create(data={'k1': {'x1': 'y1'}, 'k2': 'v2'})
+
+        BJson.update(data=BJson.data.concat({
+            'k1': {'x2': 'y2'},
+            'k3': 'v3'})).execute()
+        b2 = BJson.get(BJson.id == b.id)
+        self.assertEqual(b2.data, {'k1': {'x2': 'y2'}, 'k2': 'v2', 'k3': 'v3'})
+
     def test_integer_index_weirdness(self):
         self._create_test_data()
 
@@ -738,6 +930,48 @@ class TestBinaryJsonField(BaseJsonFieldTestCase, ModelTestCase):
             (5, 7),
             ('k4', None)])
 
+    def test_conflict_update(self):
+        b1 = BJson.create(data={'k1': 'v1'})
+        iq = (BJson
+              .insert(id=b1.id, data={'k1': 'v1-x'})
+              .on_conflict('update', conflict_target=[BJson.id],
+                           update={BJson.data: {'k1': 'v1-z'}}))
+        b1_id_db = iq.execute()
+        self.assertEqual(b1.id, b1_id_db)
+
+        b1_db = BJson.get(BJson.id == b1.id)
+        self.assertEqual(BJson.data, {'k1': 'v1-z'})
+
+        iq = (BJson
+              .insert(id=b1.id, data={'k1': 'v1-y'})
+              .on_conflict('update', conflict_target=[BJson.id],
+                           update={'data': {'k1': 'v1-w'}}))
+        b1_id_db = iq.execute()
+        self.assertEqual(b1.id, b1_id_db)
+
+        b1_db = BJson.get(BJson.id == b1.id)
+        self.assertEqual(BJson.data, {'k1': 'v1-w'})
+
+        self.assertEqual(BJson.select().count(), 1)
+
+
+@skip_unless(JSON_SUPPORT, 'json support unavailable')
+class TestBinaryJsonFieldBulkUpdate(ModelTestCase):
+    database = db
+    requires = [BJson]
+
+    def test_binary_json_field_bulk_update(self):
+        b1 = BJson.create(data={'k1': 'v1'})
+        b2 = BJson.create(data={'k2': 'v2'})
+        b1.data['k1'] = 'v1-x'
+        b2.data['k2'] = 'v2-y'
+        BJson.bulk_update([b1, b2], fields=[BJson.data])
+
+        b1_db = BJson.get(BJson.id == b1.id)
+        b2_db = BJson.get(BJson.id == b2.id)
+        self.assertEqual(b1_db.data, {'k1': 'v1-x'})
+        self.assertEqual(b2_db.data, {'k2': 'v2-y'})
+
 
 class TestIntervalField(ModelTestCase):
     database = db
@@ -762,7 +996,7 @@ class TestIntervalField(ModelTestCase):
 class TestIndexedField(BaseTestCase):
     def test_indexed_field_ddl(self):
         class FakeIndexedField(IndexedFieldMixin, CharField):
-            index_type = 'FAKE'
+            default_index_type = 'GiST'
 
         class IndexedModel(TestModel):
             array_index = ArrayField(CharField)
@@ -796,6 +1030,59 @@ class TestIndexedField(BaseTestCase):
              'USING MAGIC ("fake_index_with_type")')])
 
 
+class IDAlways(TestModel):
+    id = IdentityField(generate_always=True)
+    data = CharField()
+
+
+class IDByDefault(TestModel):
+    id = IdentityField()
+    data = CharField()
+
+
+@skip_unless(pg10(), 'identity field requires pg >= 10')
+class TestIdentityField(ModelTestCase):
+    database = db
+    requires = [IDAlways, IDByDefault]
+
+    def test_identity_field_always(self):
+        iq = IDAlways.insert_many([(d,) for d in ('d1', 'd2', 'd3')])
+        curs = iq.execute()
+        self.assertEqual(list(curs), [(1,), (2,), (3,)])
+
+        # Cannot specify id when generate always is true.
+        with self.assertRaises(ProgrammingError):
+            with self.database.atomic():
+                IDAlways.create(id=10, data='d10')
+
+        query = IDAlways.select().order_by(IDAlways.id)
+        self.assertEqual(list(query.tuples()), [
+            (1, 'd1'), (2, 'd2'), (3, 'd3')])
+
+    def test_identity_field_by_default(self):
+        iq = IDByDefault.insert_many([(d,) for d in ('d1', 'd2', 'd3')])
+        curs = iq.execute()
+        self.assertEqual(list(curs), [(1,), (2,), (3,)])
+
+        # Cannot specify id when generate always is true.
+        IDByDefault.create(id=10, data='d10')
+
+        query = IDByDefault.select().order_by(IDByDefault.id)
+        self.assertEqual(list(query.tuples()), [
+            (1, 'd1'), (2, 'd2'), (3, 'd3'), (10, 'd10')])
+
+    def test_schema(self):
+        sql, params = IDAlways._schema._create_table(False).query()
+        self.assertEqual(sql, (
+            'CREATE TABLE "id_always" ("id" INT GENERATED ALWAYS AS IDENTITY '
+            'NOT NULL PRIMARY KEY, "data" VARCHAR(255) NOT NULL)'))
+
+        sql, params = IDByDefault._schema._create_table(False).query()
+        self.assertEqual(sql, (
+            'CREATE TABLE "id_by_default" ("id" INT GENERATED BY DEFAULT AS '
+            'IDENTITY NOT NULL PRIMARY KEY, "data" VARCHAR(255) NOT NULL)'))
+
+
 class TestServerSide(ModelTestCase):
     database = db
     requires = [Register]
@@ -817,3 +1104,96 @@ class TestServerSide(ModelTestCase):
 
         ss_query = ServerSide(query.where(SQL('1 = 0')))
         self.assertEqual(list(ss_query), [])
+
+
+class KX(TestModel):
+    key = CharField(unique=True)
+    value = IntegerField()
+
+class TestAutocommitIntegration(ModelTestCase):
+    database = db
+    requires = [KX]
+
+    def setUp(self):
+        super(TestAutocommitIntegration, self).setUp()
+        with self.database.atomic():
+            kx1 = KX.create(key='k1', value=1)
+
+    def force_integrity_error(self):
+        # Force an integrity error, then verify that the current
+        # transaction has been aborted.
+        self.assertRaises(IntegrityError, KX.create, key='k1', value=10)
+        self.assertRaises(InternalError, KX.get, key='k1')
+
+    def test_autocommit_default(self):
+        kx2 = KX.create(key='k2', value=2)  # Will be committed.
+        self.assertTrue(kx2.id > 0)
+        self.force_integrity_error()
+        self.database.rollback()
+
+        self.assertEqual(KX.select().count(), 2)
+        self.assertEqual([(kx.key, kx.value)
+                          for kx in KX.select().order_by(KX.key)],
+                         [('k1', 1), ('k2', 2)])
+
+    def test_autocommit_disabled(self):
+        with self.database.manual_commit():
+            kx2 = KX.create(key='k2', value=2)  # Not committed.
+            self.assertTrue(kx2.id > 0)  # Yes, we have a primary key.
+            self.force_integrity_error()
+            self.database.rollback()
+
+        self.assertEqual(KX.select().count(), 1)
+        kx1_db = KX.get(KX.key == 'k1')
+        self.assertEqual(kx1_db.value, 1)
+
+    def test_atomic_block(self):
+        with self.database.atomic() as txn:
+            kx2 = KX.create(key='k2', value=2)
+            self.assertTrue(kx2.id > 0)
+            self.force_integrity_error()
+            txn.rollback(False)
+
+        self.assertEqual(KX.select().count(), 1)
+        kx1_db = KX.get(KX.key == 'k1')
+        self.assertEqual(kx1_db.value, 1)
+
+    def test_atomic_block_exception(self):
+        with self.assertRaises(IntegrityError):
+            with self.database.atomic():
+                KX.create(key='k2', value=2)
+                KX.create(key='k1', value=10)
+
+        self.assertEqual(KX.select().count(), 1)
+
+
+class TestPostgresIsolationLevel(DatabaseTestCase):
+    database = db_loader('postgres', isolation_level=3)  # SERIALIZABLE.
+
+    def test_isolation_level(self):
+        conn = self.database.connection()
+        self.assertEqual(conn.isolation_level, 3)
+
+        conn.set_isolation_level(2)
+        self.assertEqual(conn.isolation_level, 2)
+
+        self.database.close()
+        conn = self.database.connection()
+        self.assertEqual(conn.isolation_level, 3)
+
+
+@skip_unless(pg12(), 'cte materialization requires pg >= 12')
+class TestPostgresCTEMaterialization(ModelTestCase):
+    database = db
+    requires = [Register]
+
+    def test_postgres_cte_materialization(self):
+        Register.insert_many([(i,) for i in (1, 2, 3)]).execute()
+
+        for materialized in (None, False, True):
+            cte = Register.select().cte('t', materialized=materialized)
+            query = (cte
+                     .select_from(cte.c.value)
+                     .where(cte.c.value != 2)
+                     .order_by(cte.c.value))
+            self.assertEqual([r.value for r in query], [1, 3])

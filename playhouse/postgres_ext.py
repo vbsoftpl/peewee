@@ -3,6 +3,7 @@ Collection of postgres-specific extensions, currently including:
 
 * Support for hstore, a key/value type storage
 """
+import json
 import logging
 import uuid
 
@@ -41,9 +42,11 @@ ACONTAINS_ANY = '&&'
 TS_MATCH = '@@'
 JSONB_CONTAINS = '@>'
 JSONB_CONTAINED_BY = '<@'
+JSONB_CONTAINS_KEY = '?'
 JSONB_CONTAINS_ANY_KEY = '?|'
 JSONB_CONTAINS_ALL_KEYS = '?&'
 JSONB_EXISTS = '?'
+JSONB_REMOVE = '-'
 
 
 class _LookupNode(ColumnBase):
@@ -68,6 +71,9 @@ class _JsonLookupBase(_LookupNode):
     def as_json(self, as_json=True):
         self._as_json = as_json
 
+    def concat(self, rhs):
+        return Expression(self.as_json(True), OP.CONCAT, Json(rhs))
+
     def contains(self, other):
         clone = self.as_json(True)
         if isinstance(other, (list, dict)):
@@ -85,6 +91,9 @@ class _JsonLookupBase(_LookupNode):
             self.as_json(True),
             JSONB_CONTAINS_ALL_KEYS,
             Value(list(keys), unpack=False))
+
+    def has_key(self, key):
+        return Expression(self.as_json(True), JSONB_CONTAINS_KEY, key)
 
 
 class JsonLookup(_JsonLookupBase):
@@ -132,20 +141,16 @@ class ObjectSlice(_LookupNode):
 
 
 class IndexedFieldMixin(object):
-    default_index_type = 'GiST'
+    default_index_type = 'GIN'
 
-    def __init__(self, index_type=None, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         kwargs.setdefault('index', True)  # By default, use an index.
         super(IndexedFieldMixin, self).__init__(*args, **kwargs)
-        if self.index:
-            self.index_type = index_type or self.default_index_type
-        else:
-            self.index_type = None
 
 
 class ArrayField(IndexedFieldMixin, Field):
-    default_index_type = 'GIN'
     passthrough = True
+    unpack = False
 
     def __init__(self, field_class=IntegerField, field_kwargs=None,
                  dimensions=1, convert_values=False, *args, **kwargs):
@@ -154,6 +159,11 @@ class ArrayField(IndexedFieldMixin, Field):
         self.convert_values = convert_values
         self.field_type = self.__field.field_type
         super(ArrayField, self).__init__(*args, **kwargs)
+
+    def bind(self, model, name, set_attribute=True):
+        ret = super(ArrayField, self).bind(model, name, set_attribute)
+        self.__field.bind(model, '__array_%s' % name, False)
+        return ret
 
     def ddl_datatype(self, ctx):
         data_type = self.__field.ddl_datatype(ctx)
@@ -224,6 +234,7 @@ class DateTimeTZField(DateTimeField):
 
 class HStoreField(IndexedFieldMixin, Field):
     field_type = 'HSTORE'
+    unpack = False
     __hash__ = Field.__hash__
 
     def __getitem__(self, key):
@@ -269,18 +280,20 @@ class HStoreField(IndexedFieldMixin, Field):
 
 class JSONField(Field):
     field_type = 'JSON'
+    unpack = False
+    _json_datatype = 'json'
 
     def __init__(self, dumps=None, *args, **kwargs):
         if Json is None:
             raise Exception('Your version of psycopg2 does not support JSON.')
-        self.dumps = dumps
+        self.dumps = dumps or json.dumps
         super(JSONField, self).__init__(*args, **kwargs)
 
     def db_value(self, value):
         if value is None:
             return value
         if not isinstance(value, Json):
-            return Json(value, dumps=self.dumps)
+            return Cast(self.dumps(value), self._json_datatype)
         return value
 
     def __getitem__(self, value):
@@ -289,6 +302,9 @@ class JSONField(Field):
     def path(self, *keys):
         return JsonPath(self, keys)
 
+    def concat(self, value):
+        return super(JSONField, self).concat(Json(value))
+
 
 def cast_jsonb(node):
     return NodeList((node, SQL('::jsonb')), glue='')
@@ -296,7 +312,7 @@ def cast_jsonb(node):
 
 class BinaryJSONField(IndexedFieldMixin, JSONField):
     field_type = 'JSONB'
-    default_index_type = 'GIN'
+    _json_datatype = 'jsonb'
     __hash__ = Field.__hash__
 
     def contains(self, other):
@@ -319,15 +335,24 @@ class BinaryJSONField(IndexedFieldMixin, JSONField):
             JSONB_CONTAINS_ALL_KEYS,
             Value(list(items), unpack=False))
 
+    def has_key(self, key):
+        return Expression(cast_jsonb(self), JSONB_CONTAINS_KEY, key)
+
+    def remove(self, *items):
+        return Expression(
+            cast_jsonb(self),
+            JSONB_REMOVE,
+            Value(list(items), unpack=False))
+
 
 class TSVectorField(IndexedFieldMixin, TextField):
     field_type = 'TSVECTOR'
-    default_index_type = 'GIN'
     __hash__ = Field.__hash__
 
-    def match(self, query, language=None):
+    def match(self, query, language=None, plain=False):
         params = (language, query) if language is not None else (query,)
-        return Expression(self, TS_MATCH, fn.to_tsquery(*params))
+        func = fn.plainto_tsquery if plain else fn.to_tsquery
+        return Expression(self, TS_MATCH, func(*params))
 
 
 def Match(field, query, language=None):
@@ -363,7 +388,7 @@ class FetchManyCursor(object):
         while True:
             rows = self.cursor.fetchmany(self.array_size)
             if not rows:
-                raise StopIteration
+                return
             for row in rows:
                 yield row
 
@@ -430,7 +455,10 @@ class PostgresqlExtDatabase(PostgresqlDatabase):
 
     def cursor(self, commit=None):
         if self.is_closed():
-            self.connect()
+            if self.autoconnect:
+                self.connect()
+            else:
+                raise InterfaceError('Error, database connection not opened.')
         if commit is __named_cursor__:
             return self._state.conn.cursor(name=str(uuid.uuid1()))
         return self._state.conn.cursor()

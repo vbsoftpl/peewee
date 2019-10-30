@@ -85,23 +85,20 @@ IS_SQLITE_OLD = IS_SQLITE and sqlite3.sqlite_version_info < (3, 18)
 IS_SQLITE_15 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 15)
 IS_SQLITE_24 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 24)
 IS_SQLITE_25 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 25)
+IS_SQLITE_30 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 30)
 IS_SQLITE_9 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 9)
 IS_MYSQL_ADVANCED_FEATURES = False
+IS_MYSQL_JSON = False
 if IS_MYSQL:
-    conn = db.connection()
-    try:
-        # pymysql
-        server_info = conn.server_version
-        if re.search('(8\.\d+\.\d+|10\.[2-9]\.)', server_info):
-            IS_MYSQL_ADVANCED_FEATURES = True
-    except AttributeError:
-        try:
-            # mysql-connector
-            server_info = conn.get_server_version()
-            IS_MYSQL_ADVANCED_FEATURES = (server_info[0] == 8 or
-                                          server_info[:2] >= (10, 2))
-        except AttributeError:
-            logger.warning('Could not determine mysql server version.')
+    db.connect()
+    server_info = db.server_version
+    if server_info[0] == 8 or server_info[:2] >= (10, 2):
+        IS_MYSQL_ADVANCED_FEATURES = True
+    elif server_info[0] == 0:
+        logger.warning('Could not determine mysql server version.')
+    if server_info[0] == 8 or ((5, 7) <= server_info[:2] <= (6, 0)):
+        # Needs actual MySQL - not MariaDB.
+        IS_MYSQL_JSON = True
     db.close()
     if not IS_MYSQL_ADVANCED_FEATURES:
         logger.warning('MySQL too old to test certain advanced features.')
@@ -225,6 +222,8 @@ class ModelTestCase(ModelDatabaseTestCase):
 
     def tearDown(self):
         # Restore the model's previous database object.
+        if not self.database.is_closed():
+            self.database.rollback()
         try:
             if self.requires:
                 self.database.drop_tables(self.requires, safe=True)
@@ -236,22 +235,17 @@ def requires_models(*models):
     def decorator(method):
         @wraps(method)
         def inner(self):
-            _db_mapping = {}
-            for model in models:
-                _db_mapping[model] = model._meta.database
-                model._meta.set_database(self.database)
-            self.database.drop_tables(models, safe=True)
-            self.database.create_tables(models)
+            with self.database.bind_ctx(models, False, False):
+                self.database.drop_tables(models, safe=True)
+                self.database.create_tables(models)
 
-            try:
-                method(self)
-            finally:
                 try:
-                    self.database.drop_tables(models)
-                except:
-                    pass
-                for model in models:
-                    model._meta.set_database(_db_mapping[model])
+                    method(self)
+                finally:
+                    try:
+                        self.database.drop_tables(models)
+                    except:
+                        pass
         return inner
     return decorator
 

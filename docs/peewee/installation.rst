@@ -12,7 +12,6 @@ Most users will want to simply install the latest version, hosted on PyPI:
 Peewee comes with a couple C extensions that will be built if Cython is
 available.
 
-* Speedups, which includes miscellaneous functions re-implemented with Cython.
 * Sqlite extensions, which includes Cython implementations of the SQLite date
   manipulation functions, the REGEXP operator, and full-text search result
   ranking algorithms.
@@ -80,8 +79,10 @@ Optional dependencies
     out there, such as ``pymysql`` or ``psycopg2`` for MySQL and Postgres
     respectively.
 
-* `Cython <http://cython.org/>`_: used for various speedups. Can give a big
-  boost to certain operations, particularly if you use SQLite.
+* `Cython <http://cython.org/>`_: used to expose additional functionality when
+  using SQLite and to implement things like search result ranking in a
+  performant manner. Since the generated C files are included with the package
+  distribution, Cython is no longer required to use the C extensions.
 * `apsw <https://github.com/rogerbinns/apsw>`_: an optional 3rd-party SQLite
   binding offering greater performance and comprehensive support for SQLite's C
   APIs. Use with :py:class:`APSWDatabase`.
@@ -95,14 +96,24 @@ Optional dependencies
   available.
 
 
-Skip Compilation of SQLite Extensions
--------------------------------------
+Note on the SQLite extensions
+-----------------------------
 
-I've received reports from Windows users that they have some trouble installing
-Peewee due to missing a SQLite shared library. If you would like to simply skip
-compilation of the SQLite-specific C extensions, you can set the ``NO_SQLITE``
-environment variable:
+Peewee includes two SQLite-specific C extensions which provide additional
+functionality and improved performance for SQLite database users. Peewee will
+attempt to determine ahead-of-time if SQLite3 is installed, and only build the
+SQLite extensions if the SQLite shared-library is available on your system.
+
+If, however, you receive errors like the following when attempting to install
+Peewee, you can explicitly disable the compilation of the SQLite C extensions
+by settings the ``NO_SQLITE`` environment variable.
 
 .. code-block:: console
 
-    $ NO_SQLITE=1 python setup.py build
+    fatal error: sqlite3.h: No such file or directory
+
+Here is how to install Peewee with the SQLite extensions explicitly disabled:
+
+.. code-block:: console
+
+    $ NO_SQLITE=1 python setup.py install

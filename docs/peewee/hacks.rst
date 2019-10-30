@@ -32,6 +32,8 @@ class that you can use as a starting point:
 
     from peewee import *
 
+    class ConflictDetectedException(Exception): pass
+
     class BaseVersionedModel(Model):
         version = IntegerField(default=1, index=True)
 
@@ -44,8 +46,9 @@ class that you can use as a starting point:
                 return self.save()
 
             # Update any data that has changed and bump the version counter.
-            field_data = dict(self._data)
+            field_data = dict(self.__data__)
             current_version = field_data.pop('version', 1)
+            self._populate_unsaved_relations(field_data)
             field_data = self._prune_fields(field_data, self.dirty_fields)
             if not field_data:
                 raise ValueError('No changes have been made.')
@@ -132,23 +135,23 @@ We will perform the aggregation in a non-correlated subquery, so we can be confi
     # a secondary reference to the table.
     TweetAlias = Tweet.alias()
 
-    # Create a subquery that will calculate the maximum Tweet create_date for each
+    # Create a subquery that will calculate the maximum Tweet created_date for each
     # user.
     subquery = (TweetAlias
                 .select(
                     TweetAlias.user,
-                    fn.MAX(TweetAlias.create_date).alias('max_ts'))
+                    fn.MAX(TweetAlias.created_date).alias('max_ts'))
                 .group_by(TweetAlias.user)
                 .alias('tweet_max_subquery'))
 
     # Query for tweets and join using the subquery to match the tweet's user
-    # and create_date.
+    # and created_date.
     query = (Tweet
              .select(Tweet, User)
              .join(User)
              .switch(Tweet)
              .join(subquery, on=(
-                 (Tweet.create_date == subquery.c.max_ts) &
+                 (Tweet.created_date == subquery.c.max_ts) &
                  (Tweet.user == subquery.c.user_id))))
 
 SQLite and MySQL are a bit more lax and permit grouping by a subset of the columns that are selected. This means we can do away with the subquery and express it quite concisely:
@@ -159,7 +162,7 @@ SQLite and MySQL are a bit more lax and permit grouping by a subset of the colum
              .select(Tweet, User)
              .join(User)
              .group_by(Tweet.user)
-             .having(Tweet.create_date == fn.MAX(Tweet.create_date)))
+             .having(Tweet.created_date == fn.MAX(Tweet.created_date)))
 
 .. _top_n_per_group:
 
@@ -182,10 +185,10 @@ The desired SQL is:
     SELECT * FROM
       (SELECT t2.id, t2.username FROM user AS t2) AS uq
        LEFT JOIN LATERAL
-      (SELECT t2.message, t2.create_date
+      (SELECT t2.message, t2.created_date
        FROM tweet AS t2
        WHERE (t2.user_id = uq.id)
-       ORDER BY t2.create_date DESC LIMIT 3)
+       ORDER BY t2.created_date DESC LIMIT 3)
       AS pq ON true
 
 To accomplish this with peewee we'll need to express the lateral join as a :py:class:`Clause`, which gives us greater flexibility than the :py:meth:`~Query.join` method.
@@ -203,9 +206,9 @@ To accomplish this with peewee we'll need to express the lateral join as a :py:c
     # outer loop via the WHERE clause. Note that we are using a
     # LIMIT clause.
     tweet_query = (TweetAlias
-                   .select(TweetAlias.message, TweetAlias.create_date)
+                   .select(TweetAlias.message, TweetAlias.created_date)
                    .where(TweetAlias.user == user_query.c.id)
-                   .order_by(TweetAlias.create_date.desc())
+                   .order_by(TweetAlias.created_date.desc())
                    .limit(3)
                    .alias('pq'))
 
@@ -221,7 +224,7 @@ To accomplish this with peewee we'll need to express the lateral join as a :py:c
     # Finally, we'll wrap these up and SELECT from the result.
     query = (Tweet
              .select(user_query.c.username, tweet_query.c.message,
-                     tweet_query.c.create_date)
+                     tweet_query.c.created_date)
              .from_(join_clause))
 
 Window functions
@@ -240,7 +243,7 @@ The desired SQL is:
             t3.username,
             RANK() OVER (
                 PARTITION BY t2.user_id
-                ORDER BY t2.create_date DESC
+                ORDER BY t2.created_date DESC
             ) AS rnk
         FROM tweet AS t2
         INNER JOIN user AS t3 ON (t2.user_id = t3.id)
@@ -262,7 +265,7 @@ To accomplish this with peewee, we will wrap the ranked Tweets in an outer query
                     User.username,
                     fn.RANK().over(
                         partition_by=[TweetAlias.user],
-                        order_by=[TweetAlias.create_date.desc()]).alias('rnk'))
+                        order_by=[TweetAlias.created_date.desc()]).alias('rnk'))
                 .join(User, on=(TweetAlias.user == User.id))
                 .alias('subq'))
 
@@ -290,7 +293,7 @@ Using ``COUNT``, we can get all tweets where there exist less than *N* tweets wi
     subquery = (TweetAlias
                 .select(fn.COUNT(TweetAlias.id))
                 .where(
-                    (TweetAlias.create_date >= Tweet.create_date) &
+                    (TweetAlias.created_date >= Tweet.created_date) &
                     (TweetAlias.user == Tweet.user)))
 
     # Wrap the subquery and filter on the count.
@@ -313,7 +316,7 @@ We can achieve similar results by doing a self-join and performing the filtering
              .switch(Tweet)
              .join(TweetAlias, on=(
                  (TweetAlias.user == Tweet.user) &
-                 (TweetAlias.create_date >= Tweet.create_date)))
+                 (TweetAlias.created_date >= Tweet.created_date)))
              .group_by(Tweet.id, Tweet.content, Tweet.user, User.username)
              .having(fn.COUNT(Tweet.id) <= 3))
 
@@ -334,7 +337,7 @@ The last example uses a ``LIMIT`` clause in a correlated subquery.
                  TweetAlias
                  .select(TweetAlias.id)
                  .where(TweetAlias.user == Tweet.user)
-                 .order_by(TweetAlias.create_date.desc())
+                 .order_by(TweetAlias.created_date.desc())
                  .limit(3))))
 
 
@@ -399,3 +402,79 @@ To implement ``login``-type functionality, you could write something like this:
         except User.DoesNotExist:
             # Incorrect username and/or password.
             return False
+
+.. _datemath:
+
+Date math
+---------
+
+Each of the databases supported by Peewee implement their own set of functions
+and semantics for date/time arithmetic.
+
+This section will provide a short scenario and example code demonstrating how
+you might utilize Peewee to do dynamic date manipulation in SQL.
+
+Scenario: we need to run certain tasks every *X* seconds, and both the task
+intervals and the task themselves are defined in the database. We need to write
+some code that will tell us which tasks we should run at a given time:
+
+.. code-block:: python
+
+    class Schedule(Model):
+        interval = IntegerField()  # Run this schedule every X seconds.
+
+
+    class Task(Model):
+        schedule = ForeignKeyField(Schedule, backref='tasks')
+        command = TextField()  # Run this command.
+        last_run = DateTimeField()  # When was this run last?
+
+Our logic will essentially boil down to::
+
+.. code-block:: python
+
+    # e.g., if the task was last run at 12:00:05, and the associated interval
+    # is 10 seconds, the next occurrence should be 12:00:15. So we check
+    # whether the current time (now) is 12:00:15 or later.
+    now >= task.last_run + schedule.interval
+
+So we can write the following code:
+
+.. code-block:: python
+
+    next_occurrence = something  # ??? how do we define this ???
+
+    # We can express the current time as a Python datetime value, or we could
+    # alternatively use the appropriate SQL function/name.
+    now = Value(datetime.datetime.now())  # Or SQL('current_timestamp'), e.g.
+
+    query = (Task
+             .select(Task, Schedule)
+             .join(Schedule)
+             .where(now >= next_occurrence))
+
+For Postgresql we will multiple a static 1-second interval to calculate the
+offsets dynamically:
+
+.. code-block:: python
+
+    second = SQL("INTERVAL '1 second'")
+    next_occurrence = Task.last_run + (Schedule.interval * second)
+
+For MySQL we can reference the schedule's interval directly:
+
+.. code-block:: python
+
+    from peewee import NodeList  # Needed to construct sql entity.
+
+    interval = NodeList((SQL('INTERVAL'), Schedule.interval, SQL('SECOND')))
+    next_occurrence = fn.date_add(Task.last_run, interval)
+
+For SQLite, things are slightly tricky because SQLite does not have a dedicated
+datetime type. So for SQLite, we convert to a unix timestamp, add the schedule
+seconds, then convert back to a comparable datetime representation:
+
+.. code-block:: python
+
+    next_ts = fn.strftime('%s', Task.last_run) + Schedule.interval
+    next_occurrence = fn.datetime(next_ts, 'unixepoch')
